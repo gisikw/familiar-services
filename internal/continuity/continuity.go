@@ -601,7 +601,28 @@ func importHandoffs(db *sql.DB, dir string) error {
 	if _, err = tx.Exec(`DELETE FROM parts WHERE source='handoff'`); err != nil {
 		return err
 	}
+	// Most handoffs are recorded in-session: /clear writes a Pi compaction whose
+	// summary is the handoff text, and the parent chain already carries
+	// continuity. Index those (and any custom entry carrying the text) once, so a
+	// recorded handoff is never re-attached or re-linked by the heuristic.
+	recorded := map[string]bool{}
+	cr, err := tx.Query(`SELECT body_json FROM parts WHERE source IN ('pi:compaction','pi:custom_message','pi:custom','user')`)
+	if err != nil {
+		return err
+	}
+	for cr.Next() {
+		var raw string
+		_ = cr.Scan(&raw)
+		if !strings.Contains(raw, "Handoff") && !strings.Contains(raw, "handoff") {
+			continue
+		}
+		collectStrings(raw, recorded)
+	}
+	cr.Close()
 	for _, h := range hs {
+		if recorded[h.body] || recorded[strings.TrimSpace(h.body)] {
+			continue
+		}
 		recv := -1
 		for i := range ss {
 			if !ss[i].t.Before(h.ts) && ss[i].first != "" {
@@ -619,21 +640,7 @@ func importHandoffs(db *sql.DB, dir string) error {
 			}
 		}
 		bodyJSON, _ := json.Marshal(h.body)
-		var present int
-		// Exact decoded value/block containment avoids duplicating a handoff Pi already recorded.
-		pr, qe := tx.Query(`SELECT body_json FROM parts p JOIN turns t ON t.id=p.turn_id WHERE t.session_id=?`, ss[recv].id)
-		if qe != nil {
-			return qe
-		}
-		for pr.Next() {
-			var raw string
-			_ = pr.Scan(&raw)
-			if jsonContains(raw, h.body) {
-				present = 1
-			}
-		}
-		pr.Close()
-		if present == 0 {
+		{
 			var idx int
 			if err = tx.QueryRow(`SELECT coalesce(max(idx),-1)+1 FROM parts WHERE turn_id=?`, ss[recv].first).Scan(&idx); err != nil {
 				return err
@@ -650,6 +657,31 @@ func importHandoffs(db *sql.DB, dir string) error {
 	}
 	return tx.Commit()
 }
+// collectStrings adds every decoded string value in raw (and its trimmed form) to set.
+func collectStrings(raw string, set map[string]bool) {
+	var v any
+	if json.Unmarshal([]byte(raw), &v) != nil {
+		return
+	}
+	var walk func(any)
+	walk = func(x any) {
+		switch z := x.(type) {
+		case string:
+			set[z] = true
+			set[strings.TrimSpace(z)] = true
+		case []any:
+			for _, y := range z {
+				walk(y)
+			}
+		case map[string]any:
+			for _, y := range z {
+				walk(y)
+			}
+		}
+	}
+	walk(v)
+}
+
 func jsonContains(raw, want string) bool {
 	var v any
 	if json.Unmarshal([]byte(raw), &v) != nil {
