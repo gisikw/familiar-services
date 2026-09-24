@@ -42,10 +42,22 @@ A fork's life:
 Which branch is "primary" after concurrent work (for example local model on a
 plane versus server-side jobs) is decided at merge time, by Kevin and Kes.
 
+## Process ownership (decided 2026-09-23)
+
+No service is the parent of a Familiar Pi. Three kinds of systemd unit, each
+restartable without disturbing the others:
+
+- **familiar-services** — the singletons. familiar-services asks systemd to
+  start/stop Familiars; it never parents them. Redeploys are invisible to a
+  running Familiar; `imp` retries across a brief restart.
+- **familiar-router** — same binary, `--router` mode, separate unit. Restarting
+  it mid-stream truncates a turn, so it drains before deploy: stop accepting new
+  streams, let in-flight ones finish, then exit.
+- **familiar-pi@<id>** — templated unit per Familiar (conventional primary or
+  fork). Gateway only proxies clients to them; it owns auth and client protocol.
+
 ## Open questions
 
-- Does the gateway own process spawning, or does a `presence` service here do
-  it, with the gateway only proxying?
 - Is `projects` its own service or a view over `fleet`?
 - Router cutover: rename in place or run both until clients move?
 - Where does the canon/identity store live — here, or stay in
