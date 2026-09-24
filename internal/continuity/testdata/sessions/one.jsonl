@@ -1,0 +1,9 @@
+{"type":"session","version":3,"id":"sess-one","timestamp":"2026-08-27T03:00:00.000Z","cwd":"/scrubbed/project"}
+{"type":"model_change","id":"model001","parentId":null,"timestamp":"2026-08-27T03:00:00.100Z","provider":"example","modelId":"model-a"}
+{"type":"message","id":"user0001","parentId":"model001","timestamp":"2026-08-27T03:00:01.000Z","message":{"role":"user","content":[{"type":"text", "text":"hello"}],"timestamp":1787799601000}}
+{"type":"message","id":"asst0001","parentId":"user0001","timestamp":"2026-08-27T03:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"first path"}],"provider":"example","model":"model-a","usage":{"totalTokens":2},"stopReason":"stop","timestamp":1787799602000}}
+{"type":"branch_summary","id":"branch01","parentId":"user0001","timestamp":"2026-08-27T03:00:03.000Z","fromId":"asst0001","summary":"the abandoned path","details":{"modifiedFiles":["scrubbed"]}}
+{"type":"message","id":"asst0002","parentId":"branch01","timestamp":"2026-08-27T03:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"alternate path"}],"provider":"example","model":"model-a","usage":{"totalTokens":3},"stopReason":"stop","timestamp":1787799604000}}
+{"type":"compaction","id":"compact1","parentId":"asst0002","timestamp":"2026-08-27T03:00:05.000Z","summary":"conversation summary","firstKeptEntryId":"branch01","tokensBefore":50000,"details":{"readFiles":["a"]}}
+{"type":"custom","id":"custom01","parentId":"compact1","timestamp":"2026-08-27T03:00:06.000Z","customType":"fixture-state","data":{"count":42}}
+{"type":"custom_message","id":"custom02","parentId":"custom01","timestamp":"2026-08-27T03:00:07.000Z","customType":"fixture-context","content":"injected context","display":false}

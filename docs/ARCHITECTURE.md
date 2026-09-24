@@ -67,8 +67,9 @@ Identity is not a service. It is whatever file or directory the Familiar
 config points to; Pi reads it at launch as its system prompt. There is no
 identity package.
 
-Continuity is the record. System prompts are persisted as turns like
-everything else, so historical identity is fully preserved in the registry:
-for any conversation you can see exactly which version of Kes was present.
-Handoffs likewise live only as turns (`handoff` parts + edges); no separate
-handoff files. Readable exports are derived from the registry if wanted.
+Continuity is the record, but its M0 SQLite representation is a disposable,
+read-only projection of Pi session JSONL and timestamp-named handoff files. Pi
+does not currently persist its system prompt in v3 session files, so historical
+identity cannot yet be reconstructed and the importer does not invent it.
+Handoffs are projected as attributed parts and inferred edges; readable views
+remain derived from the registry.

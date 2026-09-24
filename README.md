@@ -3,7 +3,7 @@
 The singleton layer of Familiar: everything that must exist **exactly once**
 regardless of how many Familiar Pi processes are running.
 
-> Status: proposal scaffold. Nothing here runs yet.
+> Status: Milestone 0 provides a read-only continuity mirror and its NixOS import units.
 
 ## Why this exists
 
