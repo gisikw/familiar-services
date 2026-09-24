@@ -1,0 +1,7 @@
+{"type":"session","version":3,"id":"prompt-session","timestamp":"2026-09-25T10:00:00.000Z","cwd":"/scrubbed/project"}
+{"type":"custom","id":"prompt01","parentId":null,"timestamp":"2026-09-25T10:00:00.100Z","customType":"familiar.system-prompt.v1","data":{"sha256":"e5e00625b9bb4583ada8a7d1d71caeabfc7ef0d4a70e9426e82ba0c12101e5af","text":"Prompt alpha"}}
+{"type":"message","id":"user0001","parentId":"prompt01","timestamp":"2026-09-25T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"first turn"}]}}
+{"type":"message","id":"asst0001","parentId":"user0001","timestamp":"2026-09-25T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"unchanged prompt, so no custom entry"}]}}
+{"type":"custom","id":"prompt02","parentId":"asst0001","timestamp":"2026-09-25T10:00:03.000Z","customType":"familiar.system-prompt.v1","data":{"sha256":"2fcfb6024ff49f090300f99c2a41ad5a1555bce95bdb2e3f86172b6986d3c83a","text":"Prompt beta"}}
+{"type":"custom","id":"badtext1","parentId":"prompt02","timestamp":"2026-09-25T10:00:04.000Z","customType":"familiar.system-prompt.v1","data":{"sha256":"2fcfb6024ff49f090300f99c2a41ad5a1555bce95bdb2e3f86172b6986d3c83a"}}
+{"type":"custom","id":"badhash1","parentId":"badtext1","timestamp":"2026-09-25T10:00:05.000Z","customType":"familiar.system-prompt.v1","data":{"text":"Prompt gamma"}}

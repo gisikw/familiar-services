@@ -54,14 +54,17 @@ that parent: this is Pi's durable representation of `/tree` navigation. A
 `branch_summary.fromId` remains faithfully available in the raw attributed part
 but is not treated as ancestry (it identifies the abandoned tip, not the split).
 
-### Known system-prompt gap
+### System prompts
 
-Pi's v3 session header and entry union do **not** persist the system prompt, and
-the real harness session inspected for M0 did not contain it. The importer does
-not invent one. It will preserve a `systemPrompt` header field as a turn-0
-`system` part if a producer supplies that field, but ordinary current Pi
-sessions therefore cannot reconstruct historical system prompts. This
-supersedes the earlier assumption that prompts were always persisted.
+The Familiar Pi extension records the exact system prompt in a Pi custom entry
+with custom type `familiar.system-prompt.v1` and data containing its `sha256`
+and `text`. It writes the entry on the session's first turn and whenever the
+prompt changes. The importer keeps the raw entry envelope verbatim in
+`parts.body_json`, projects the part's source as `system`, and attaches it to
+the turn created by that entry. Missing or malformed prompt data remains a raw
+`pi:custom` part and is also reported in `import_errors`, so source material is
+never dropped. Other Pi custom entries are unchanged. Sessions created before
+this mechanism was introduced have no recorded system prompt.
 
 ## Edges and leaves
 

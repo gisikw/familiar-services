@@ -1,10 +1,10 @@
--- Continuity derived index. SQLite. Schema version 1.
+-- Continuity derived index. SQLite. Schema version 2.
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE schema_version (
   version INTEGER NOT NULL
 );
-INSERT INTO schema_version(version) VALUES (1);
+INSERT INTO schema_version(version) VALUES (2);
 
 CREATE TABLE sessions (
   id            TEXT PRIMARY KEY, -- source-format namespaced session ID

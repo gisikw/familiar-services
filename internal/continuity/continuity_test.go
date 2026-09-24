@@ -95,6 +95,99 @@ func TestImportFaithfulTreeHandoffAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestSystemPromptCustomEntries(t *testing.T) {
+	root := t.TempDir()
+	sessions := filepath.Join(root, "sessions")
+	handoffs := filepath.Join(root, "handoffs")
+	copyTree(t, "testdata/system-prompts", sessions)
+	if err := os.MkdirAll(handoffs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opts := ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: filepath.Join(root, "continuity.db")}
+	if err := Import(opts); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(opts.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if got := count(t, db, `SELECT count(*) FROM parts WHERE source='system'`); got != 2 {
+		t.Fatalf("system prompt parts=%d", got)
+	}
+	if got := count(t, db, `SELECT count(*) FROM parts WHERE source='system' AND turn_id='pi:prompt-session:prompt01'`); got != 1 {
+		t.Fatalf("first-turn system prompt parts=%d", got)
+	}
+	if got := count(t, db, `SELECT count(*) FROM parts WHERE source='system' AND turn_id IN ('pi:prompt-session:user0001','pi:prompt-session:asst0001')`); got != 0 {
+		t.Fatalf("unchanged turns unexpectedly have %d prompt parts", got)
+	}
+	if got := count(t, db, `SELECT count(*) FROM edges WHERE child_id='pi:prompt-session:prompt02' AND parent_id='pi:prompt-session:asst0001' AND edge_type='continue'`); got != 1 {
+		t.Fatalf("changed prompt ancestry edges=%d", got)
+	}
+
+	var raw string
+	if err := db.QueryRow(`SELECT body_json FROM parts WHERE turn_id='pi:prompt-session:prompt02'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	wantRaw := `{"type":"custom","id":"prompt02","parentId":"asst0001","timestamp":"2026-09-25T10:00:03.000Z","customType":"familiar.system-prompt.v1","data":{"sha256":"2fcfb6024ff49f090300f99c2a41ad5a1555bce95bdb2e3f86172b6986d3c83a","text":"Prompt beta"}}`
+	if raw != wantRaw {
+		t.Fatalf("system prompt entry normalized:\n got %q\nwant %q", raw, wantRaw)
+	}
+
+	if got := count(t, db, `SELECT count(*) FROM parts WHERE source='pi:custom' AND turn_id IN ('pi:prompt-session:badtext1','pi:prompt-session:badhash1')`); got != 2 {
+		t.Fatalf("malformed raw custom parts=%d", got)
+	}
+	if got := count(t, db, `SELECT count(*) FROM import_errors`); got != 2 {
+		t.Fatalf("malformed prompt errors=%d", got)
+	}
+	s, err := ReadStats(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.SystemPrompts != 2 {
+		t.Fatalf("distinct system prompts=%d", s.SystemPrompts)
+	}
+	if !strings.Contains(FormatStats(s), "system prompts: 2\n") {
+		t.Fatalf("stats missing system prompt count:\n%s", FormatStats(s))
+	}
+}
+
+func TestSchemaVersionMismatchRebuilds(t *testing.T) {
+	root := t.TempDir()
+	sessions := filepath.Join(root, "sessions")
+	handoffs := filepath.Join(root, "handoffs")
+	if err := os.MkdirAll(sessions, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(handoffs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(root, "continuity.db")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES(1); CREATE TABLE stale(value TEXT);`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if err = Import(ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: dbPath}); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := count(t, db, `SELECT version FROM schema_version`); got != SchemaVersion {
+		t.Fatalf("schema version=%d", got)
+	}
+	if got := count(t, db, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='stale'`); got != 0 {
+		t.Fatal("stale version-1 schema was not rebuilt")
+	}
+}
+
 func TestTruncatedTrailingLineWaitsForCompletion(t *testing.T) {
 	root := t.TempDir()
 	sessions := filepath.Join(root, "sessions")

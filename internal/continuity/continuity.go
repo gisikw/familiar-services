@@ -21,7 +21,10 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const SchemaVersion = 1
+const (
+	SchemaVersion          = 2
+	systemPromptCustomType = "familiar.system-prompt.v1"
+)
 
 // ErrStopped is returned by the test-only StopAfter hook, simulating termination.
 var ErrStopped = errors.New("import stopped")
@@ -44,15 +47,22 @@ type header struct {
 }
 
 type entry struct {
-	Type      string          `json:"type"`
-	ID        string          `json:"id"`
-	ParentID  *string         `json:"parentId"`
-	Timestamp string          `json:"timestamp"`
-	Message   json.RawMessage `json:"message"`
-	FromID    string          `json:"fromId"`
-	Name      *string         `json:"name"`
-	Provider  string          `json:"provider"`
-	ModelID   string          `json:"modelId"`
+	Type       string          `json:"type"`
+	ID         string          `json:"id"`
+	ParentID   *string         `json:"parentId"`
+	Timestamp  string          `json:"timestamp"`
+	Message    json.RawMessage `json:"message"`
+	FromID     string          `json:"fromId"`
+	Name       *string         `json:"name"`
+	Provider   string          `json:"provider"`
+	ModelID    string          `json:"modelId"`
+	CustomType string          `json:"customType"`
+	Data       json.RawMessage `json:"data"`
+}
+
+type systemPromptData struct {
+	SHA256 *string `json:"sha256"`
+	Text   *string `json:"text"`
 }
 
 type message struct {
@@ -341,7 +351,7 @@ func importFile(db *sql.DB, path string, remaining int) (int, error) {
 			}
 			continue
 		}
-		if err = insertEntry(db, path, sessionID, e, raw, inode, size, mtime, offset); err != nil {
+		if err = insertEntry(db, path, sessionID, e, raw, start, inode, size, mtime, offset); err != nil {
 			return count, err
 		}
 		count++
@@ -385,7 +395,7 @@ func insertHeader(db *sql.DB, path string, h header, raw []byte, sid string, ino
 	return tx.Commit()
 }
 
-func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, inode, size, mtime, offset int64) error {
+func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, lineOffset, inode, size, mtime, offset int64) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -417,6 +427,14 @@ func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, inode, size,
 	if e.Type == "custom_message" {
 		role = "custom"
 		source = "pi:custom_message"
+	}
+	var entryError string
+	if e.Type == "custom" && e.CustomType == systemPromptCustomType {
+		if err := validateSystemPrompt(e.Data); err != nil {
+			entryError = "invalid " + systemPromptCustomType + " entry: " + err.Error()
+		} else {
+			source = "system"
+		}
 	}
 	if e.Type == "branch_summary" {
 		role = "metadata"
@@ -462,11 +480,36 @@ func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, inode, size,
 			return err
 		}
 	}
+	if entryError != "" {
+		if _, err = tx.Exec(`INSERT INTO import_errors(path,byte_offset,error,occurred_at) VALUES(?,?,?,?)
+			ON CONFLICT(path,byte_offset) DO UPDATE SET error=excluded.error,occurred_at=excluded.occurred_at`, path, lineOffset, entryError, now()); err != nil {
+			return err
+		}
+	}
 	_, err = tx.Exec(`UPDATE import_state SET inode=?,size=?,mtime_ns=?,byte_offset=?,last_entry_id=?,imported_at=? WHERE path=?`, inode, size, mtime, offset, e.ID, now(), path)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func validateSystemPrompt(raw json.RawMessage) error {
+	var data systemPromptData
+	if len(raw) == 0 || json.Unmarshal(raw, &data) != nil {
+		return errors.New("data must be an object")
+	}
+	if data.SHA256 == nil {
+		return errors.New("data.sha256 is required")
+	}
+	if len(*data.SHA256) != 64 || strings.IndexFunc(*data.SHA256, func(r rune) bool {
+		return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F'))
+	}) != -1 {
+		return errors.New("data.sha256 must be a 64-character hexadecimal string")
+	}
+	if data.Text == nil {
+		return errors.New("data.text is required")
+	}
+	return nil
 }
 
 func checkpoint(db *sql.DB, path string, inode, size, mtime, offset int64, last, sid string) error {
@@ -494,9 +537,9 @@ func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 // Stats is the compact set printed by the stats command.
 type Stats struct {
-	Sessions, Turns, Parts, LiveLeaves, ImportErrors int64
-	Edges                                            map[string]int64
-	LastImport                                       string
+	Sessions, Turns, Parts, SystemPrompts, LiveLeaves, ImportErrors int64
+	Edges                                                           map[string]int64
+	LastImport                                                      string
 }
 
 func ReadStats(db *sql.DB) (Stats, error) {
@@ -504,7 +547,9 @@ func ReadStats(db *sql.DB) (Stats, error) {
 	for _, q := range []struct {
 		sql string
 		dst *int64
-	}{{`SELECT count(*) FROM sessions`, &s.Sessions}, {`SELECT count(*) FROM turns`, &s.Turns}, {`SELECT count(*) FROM parts`, &s.Parts}, {`SELECT count(*) FROM live_branches`, &s.LiveLeaves}, {`SELECT count(*) FROM import_errors`, &s.ImportErrors}} {
+	}{{`SELECT count(*) FROM sessions`, &s.Sessions}, {`SELECT count(*) FROM turns`, &s.Turns}, {`SELECT count(*) FROM parts`, &s.Parts},
+		{`SELECT count(DISTINCT json_extract(body_json,'$.data.sha256')) FROM parts WHERE source='system' AND json_extract(body_json,'$.customType')='familiar.system-prompt.v1'`, &s.SystemPrompts},
+		{`SELECT count(*) FROM live_branches`, &s.LiveLeaves}, {`SELECT count(*) FROM import_errors`, &s.ImportErrors}} {
 		if err := db.QueryRow(q.sql).Scan(q.dst); err != nil {
 			return s, err
 		}
@@ -657,6 +702,7 @@ func importHandoffs(db *sql.DB, dir string) error {
 	}
 	return tx.Commit()
 }
+
 // collectStrings adds every decoded string value in raw (and its trimmed form) to set.
 func collectStrings(raw string, set map[string]bool) {
 	var v any
@@ -713,7 +759,7 @@ func jsonContains(raw, want string) bool {
 // FormatStats returns the intentionally small human-readable report.
 func FormatStats(s Stats) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "sessions: %d\nturns: %d\nparts: %d\n", s.Sessions, s.Turns, s.Parts)
+	fmt.Fprintf(&b, "sessions: %d\nturns: %d\nparts: %d\nsystem prompts: %d\n", s.Sessions, s.Turns, s.Parts, s.SystemPrompts)
 	keys := make([]string, 0, len(s.Edges))
 	for k := range s.Edges {
 		keys = append(keys, k)
