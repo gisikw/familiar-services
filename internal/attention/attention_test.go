@@ -2,6 +2,7 @@ package attention
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -57,5 +58,29 @@ func TestJotDoneAndClear(t *testing.T) {
 	x, e := s.Handle("jot.clear-done", map[string]any{})
 	if e != nil || x.(map[string]any)["archived"] != 1 {
 		t.Fatalf("clear: %#v %v", x, e)
+	}
+}
+
+func TestCardPrefixResolution(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "a.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err = s.Handle("project.add", map[string]any{"slug": "p"}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.Handle("card.add", map[string]any{"project": "p", "title": "t", "lane": "inflight"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := c.(map[string]any)["id"].(string)
+	for _, ref := range []string{id, id[:8], strings.ReplaceAll(id, "-", "")[:12]} {
+		if _, err := s.Handle("note.add", map[string]any{"card": ref, "text": "a/b/c"}); err != nil {
+			t.Fatalf("%s: %v", ref, err)
+		}
+	}
+	if _, err := s.Handle("card.get", map[string]any{"id": id[:7]}); err == nil {
+		t.Fatal("short prefix accepted")
 	}
 }

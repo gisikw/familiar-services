@@ -17,7 +17,7 @@ func TestCopiesOfRealStores(t *testing.T) {
 	tmp := t.TempDir()
 	dbSource := os.Getenv("FAMILIAR_ATTENTION_DB")
 	if dbSource == "" {
-		for _, p := range []string{"/var/lib/kestrel/state/familiar-ui/attention.sqlite", "/var/lib/golem/herdr/state/familiar-ui/attention.sqlite"} {
+		for _, p := range []string{"/home/familiar/.local/state/familiar-ui/attention.sqlite", "/var/lib/kestrel/state/familiar-ui/attention.sqlite", "/var/lib/golem/herdr/state/familiar-ui/attention.sqlite"} {
 			if _, e := os.Stat(p); e == nil {
 				dbSource = p
 				break

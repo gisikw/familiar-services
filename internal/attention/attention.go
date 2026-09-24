@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	"strings"
 	"sync"
@@ -118,23 +119,6 @@ func one(x string, v ...string) bool {
 func allowed(a map[string]any, names ...string) bool {
 	for k := range a {
 		if !one(k, names...) {
-			return false
-		}
-	}
-	return true
-}
-func uuidLike(x string) bool {
-	if len(x) != 36 {
-		return false
-	}
-	for i, r := range x {
-		if i == 8 || i == 13 || i == 18 || i == 23 {
-			if r != '-' {
-				return false
-			}
-			continue
-		}
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
 			return false
 		}
 	}
@@ -525,9 +509,13 @@ func (s *Store) Handle(op string, a map[string]any) (any, error) {
 		cr.Close()
 		return map[string]any{"slug": slug, "label": label, "default_policy": policy, "repo": n(repo), "counts": counts}, nil
 	case "card.get":
-		id, ok := str(a, "id")
-		if !ok || !uuidLike(id) {
+		ref, ok := str(a, "id")
+		if !ok {
 			return nil, code("invalid_request", "id required")
+		}
+		id, e := s.resolveCardID(ref)
+		if e != nil {
+			return nil, e
 		}
 		return s.full(id)
 	case "card.list":
@@ -759,9 +747,11 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 		} else {
 			id, _ = str(a, "id")
 		}
-		if !uuidLike(id) {
-			return nil, code("invalid_request", "valid card id required")
+		r, e := s.resolveCardID(id)
+		if e != nil {
+			return nil, e
 		}
+		id = r
 	}
 	v, e := s.write(func(tx *sql.Tx, at string) (any, error) {
 		exists := func() error {
@@ -1102,4 +1092,33 @@ func (s *Store) status() (any, error) {
 		}
 	}
 	return map[string]any{"agents": map[string]any{"running": running, "blocked": blocked}, "needs_attention": needs, "inflight": inflight, "jots": map[string]any{"open": open, "stale": stale}}, nil
+}
+
+// resolveCardID accepts a full UUID or a hexadecimal prefix of at least 8
+// characters (hyphens ignored), matching the TS store's resolveCardId.
+func (s *Store) resolveCardID(ref string) (string, error) {
+	n := strings.ToLower(strings.ReplaceAll(ref, "-", ""))
+	if len(n) < 8 || len(n) > 32 || strings.Trim(n, "0123456789abcdef") != "" {
+		return "", code("invalid_request", "card ID must be a full UUID or a hexadecimal card ID prefix of at least 8 characters")
+	}
+	rs, e := s.db.Query("select id from cards where replace(lower(id),'-','') glob ? order by id", n+"*")
+	if e != nil {
+		return "", e
+	}
+	defer rs.Close()
+	var ids []string
+	for rs.Next() {
+		var id string
+		if e := rs.Scan(&id); e != nil {
+			return "", e
+		}
+		ids = append(ids, id)
+	}
+	switch len(ids) {
+	case 0:
+		return "", code("not_found", fmt.Sprintf("card ID %q not found", ref))
+	case 1:
+		return ids[0], nil
+	}
+	return "", code("invalid_request", fmt.Sprintf("card ID %q is ambiguous; candidates: %s", ref, strings.Join(ids, ", ")))
 }
