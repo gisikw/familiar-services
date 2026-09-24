@@ -40,4 +40,4 @@ sees the same world through the same interface.
   derive clean views at read time.
 - Go, stdlib-first, SQLite. Nix flake for build and devshell.
 
-See `docs/ARCHITECTURE.md`, `docs/CONTINUITY.md`, and `docs/MIGRATION.md`.
+See `docs/ROADMAP.md` for the milestone sequence, plus `docs/ARCHITECTURE.md`, `docs/CONTINUITY.md`, and `docs/MIGRATION.md`.
