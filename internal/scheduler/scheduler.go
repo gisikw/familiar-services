@@ -1,0 +1,335 @@
+// Package scheduler owns durable events, delivery state, and per-instance DND.
+package scheduler
+
+import (
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+var idRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$`)
+
+type Event struct {
+	ID        string `json:"id"`
+	DueAt     int64  `json:"due_at"`
+	Target    string `json:"target"`
+	Origin    string `json:"origin"`
+	Source    string `json:"source"`
+	Priority  int    `json:"priority"`
+	Type      string `json:"type"`
+	Summary   string `json:"summary"`
+	Body      string `json:"body"`
+	State     string `json:"state"`
+	CreatedAt int64  `json:"created_at"`
+}
+type Enqueue struct {
+	ID       string `json:"id"`
+	DueAt    int64  `json:"due_at"`
+	Target   string `json:"target"`
+	Origin   string `json:"origin"`
+	Source   string `json:"source"`
+	Priority *int   `json:"priority"`
+	Type     string `json:"type"`
+	Summary  string `json:"summary"`
+	Body     string `json:"body"`
+}
+type DND struct {
+	Enabled   bool   `json:"enabled"`
+	SetBy     string `json:"setBy"`
+	SetAt     int64  `json:"setAt"`
+	ExpiresAt int64  `json:"expiresAt"`
+}
+type Store struct {
+	db  *sql.DB
+	now func() time.Time
+}
+
+func Open(stateDir string) (*Store, error) {
+	if stateDir == "" {
+		return nil, errors.New("state directory is required")
+	}
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(stateDir, "scheduler.sqlite")+"?_busy_timeout=5000&_foreign_keys=on")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	for _, q := range []string{
+		`PRAGMA journal_mode=WAL`,
+		`CREATE TABLE IF NOT EXISTS events (
+			id TEXT PRIMARY KEY, due_at INTEGER NOT NULL, target TEXT NOT NULL, origin TEXT NOT NULL,
+			source TEXT NOT NULL, priority INTEGER NOT NULL, type TEXT NOT NULL, summary TEXT NOT NULL,
+			body TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','delivered','acked')),
+			created_at INTEGER NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS events_delivery ON events(target,state,due_at,priority,created_at)`,
+		`CREATE TABLE IF NOT EXISTS dnd (target TEXT PRIMARY KEY, set_by TEXT NOT NULL, set_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
+	} {
+		if _, err = db.Exec(q); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	return &Store{db: db, now: time.Now}, nil
+}
+func (s *Store) Close() error { return s.db.Close() }
+
+func ValidTarget(target string) bool {
+	if strings.HasPrefix(target, "instance:") {
+		return len(target) > 9 && idRE.MatchString(strings.TrimPrefix(target, "instance:"))
+	}
+	if strings.HasPrefix(target, "spawn:") {
+		return len(target) > 6 && len(target) <= 200 && !strings.ContainsAny(target, "\x00\n\r")
+	}
+	return false
+}
+func NormalizeTarget(target string) string {
+	if target != "" && !strings.Contains(target, ":") {
+		return "instance:" + target
+	}
+	return target
+}
+func mint(now time.Time) string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("event-%d-%s", now.UnixMilli(), hex.EncodeToString(b[:]))
+}
+
+func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
+	in.Target = NormalizeTarget(in.Target)
+	if !ValidTarget(in.Target) {
+		return Event{}, false, errors.New("target must be instance:<session id> or spawn:<systemd unit>")
+	}
+	if in.ID != "" && !idRE.MatchString(in.ID) {
+		return Event{}, false, errors.New("invalid event id")
+	}
+	if strings.TrimSpace(in.Summary) == "" {
+		return Event{}, false, errors.New("summary is required")
+	}
+	priority := 2
+	if in.Priority != nil {
+		priority = *in.Priority
+	}
+	if priority < 0 || priority > 3 {
+		return Event{}, false, errors.New("priority must be 0..3")
+	}
+	now := s.now().UnixMilli()
+	if in.DueAt == 0 {
+		in.DueAt = now
+	}
+	if in.ID == "" {
+		in.ID = mint(s.now())
+	}
+	if in.Source == "" {
+		in.Source = "unknown"
+	}
+	if in.Type == "" {
+		in.Type = "notify"
+	}
+	if in.Body == "" {
+		in.Body = in.Summary
+	}
+	e := Event{in.ID, in.DueAt, in.Target, in.Origin, in.Source, priority, in.Type, in.Summary, in.Body, "pending", now}
+	res, err := s.db.Exec(`INSERT OR IGNORE INTO events(id,due_at,target,origin,source,priority,type,summary,body,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,'pending',?)`, e.ID, e.DueAt, e.Target, e.Origin, e.Source, e.Priority, e.Type, e.Summary, e.Body, e.CreatedAt)
+	if err != nil {
+		return Event{}, false, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		old, err := s.Get(e.ID)
+		return old, false, err
+	}
+	return e, true, nil
+}
+func scanEvent(row interface{ Scan(...any) error }) (Event, error) {
+	var e Event
+	err := row.Scan(&e.ID, &e.DueAt, &e.Target, &e.Origin, &e.Source, &e.Priority, &e.Type, &e.Summary, &e.Body, &e.State, &e.CreatedAt)
+	return e, err
+}
+func (s *Store) Get(id string) (Event, error) {
+	return scanEvent(s.db.QueryRow(`SELECT id,due_at,target,origin,source,priority,type,summary,body,state,created_at FROM events WHERE id=?`, id))
+}
+func (s *Store) List(target string) ([]Event, error) {
+	q := `SELECT id,due_at,target,origin,source,priority,type,summary,body,state,created_at FROM events WHERE state!='acked'`
+	args := []any{}
+	if target != "" {
+		q += ` AND target=?`
+		args = append(args, NormalizeTarget(target))
+	}
+	q += ` ORDER BY due_at,priority,created_at`
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Event{}
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+func (s *Store) Cancel(id string) (bool, error) {
+	r, err := s.db.Exec(`UPDATE events SET state='acked' WHERE id=? AND state!='acked'`, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := r.RowsAffected()
+	return n > 0, nil
+}
+func (s *Store) Ack(id, target string) (bool, error) {
+	r, err := s.db.Exec(`UPDATE events SET state='acked' WHERE id=? AND target=? AND state='delivered'`, id, NormalizeTarget(target))
+	if err != nil {
+		return false, err
+	}
+	n, _ := r.RowsAffected()
+	return n > 0, nil
+}
+func (s *Store) Requeue(target string) error {
+	_, err := s.db.Exec(`UPDATE events SET state='pending' WHERE target=? AND state='delivered'`, NormalizeTarget(target))
+	return err
+}
+func (s *Store) Claim(target string, now int64) (*Event, error) {
+	target = NormalizeTarget(target)
+	if strings.HasPrefix(target, "spawn:") {
+		return nil, nil
+	}
+	dnd, err := s.DNDGet(target)
+	if err != nil || dnd != nil {
+		return nil, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	e, err := scanEvent(tx.QueryRow(`SELECT id,due_at,target,origin,source,priority,type,summary,body,state,created_at FROM events WHERE target=? AND state='pending' AND due_at<=? ORDER BY priority,due_at,created_at LIMIT 1`, target, now))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(`UPDATE events SET state='delivered' WHERE id=? AND state='pending'`, e.ID); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	e.State = "delivered"
+	return &e, nil
+}
+func (s *Store) DNDGet(target string) (*DND, error) {
+	var d DND
+	err := s.db.QueryRow(`SELECT set_by,set_at,expires_at FROM dnd WHERE target=?`, NormalizeTarget(target)).Scan(&d.SetBy, &d.SetAt, &d.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	now := s.now().UnixMilli()
+	if d.ExpiresAt <= now {
+		_, _ = s.db.Exec(`DELETE FROM dnd WHERE target=?`, NormalizeTarget(target))
+		return nil, nil
+	}
+	d.Enabled = true
+	return &d, nil
+}
+func (s *Store) DNDSet(target string, enabled bool, setBy string, durationMS *int64) (*DND, error) {
+	target = NormalizeTarget(target)
+	if !ValidTarget(target) || strings.HasPrefix(target, "spawn:") {
+		return nil, errors.New("DND requires an instance target")
+	}
+	if !enabled {
+		_, err := s.db.Exec(`DELETE FROM dnd WHERE target=?`, target)
+		return nil, err
+	}
+	if setBy == "" {
+		setBy = "familiar"
+	}
+	if setBy != "user" && setBy != "familiar" {
+		return nil, errors.New("set_by must be user or familiar")
+	}
+	dur := int64(30 * 60 * 1000)
+	if durationMS != nil {
+		dur = *durationMS
+	}
+	if dur <= 0 {
+		return nil, errors.New("duration_ms must be positive")
+	}
+	if setBy == "familiar" && dur > 2*60*60*1000 {
+		dur = 2 * 60 * 60 * 1000
+	}
+	now := s.now().UnixMilli()
+	d := &DND{true, setBy, now, now + dur}
+	_, err := s.db.Exec(`INSERT INTO dnd(target,set_by,set_at,expires_at) VALUES(?,?,?,?) ON CONFLICT(target) DO UPDATE SET set_by=excluded.set_by,set_at=excluded.set_at,expires_at=excluded.expires_at`, target, setBy, d.SetAt, d.ExpiresAt)
+	return d, err
+}
+
+// Migrate imports live M2-v1 worklist items and pending wakes. Stable IDs make it safe to rerun.
+func (s *Store) Migrate(stateDir, defaultTarget string) (int, error) {
+	defaultTarget = NormalizeTarget(defaultTarget)
+	if !ValidTarget(defaultTarget) {
+		return 0, errors.New("a valid --default-target is required for migration")
+	}
+	count := 0
+	items, _ := filepath.Glob(filepath.Join(stateDir, "worklist", "items", "*.json"))
+	sort.Strings(items)
+	for _, path := range items {
+		var x struct {
+			ID                          string `json:"id"`
+			TS                          int64  `json:"ts"`
+			Priority                    int    `json:"priority"`
+			Type, Summary, Body, Source string
+		}
+		b, e := os.ReadFile(path)
+		if e != nil || json.Unmarshal(b, &x) != nil || x.ID == "" || x.Summary == "" {
+			continue
+		}
+		p := x.Priority
+		_, created, e := s.Enqueue(Enqueue{ID: x.ID, DueAt: x.TS, Target: defaultTarget, Source: x.Source, Priority: &p, Type: x.Type, Summary: x.Summary, Body: x.Body})
+		if e != nil {
+			return count, e
+		}
+		if created {
+			count++
+		}
+	}
+	wakes, _ := filepath.Glob(filepath.Join(stateDir, "wakes", "pending", "*.json"))
+	sort.Strings(wakes)
+	for _, path := range wakes {
+		var x struct {
+			ID, Reason string
+			FireAt     int64 `json:"fireAt"`
+		}
+		b, e := os.ReadFile(path)
+		if e != nil || json.Unmarshal(b, &x) != nil || x.ID == "" || x.Reason == "" {
+			continue
+		}
+		p := 1
+		_, created, e := s.Enqueue(Enqueue{ID: x.ID, DueAt: x.FireAt, Target: defaultTarget, Source: "wake", Priority: &p, Summary: "Scheduled wake: " + x.Reason, Body: "<system-reminder>Scheduled wake: " + x.Reason + "</system-reminder>"})
+		if e != nil {
+			return count, e
+		}
+		if created {
+			count++
+		}
+	}
+	return count, nil
+}

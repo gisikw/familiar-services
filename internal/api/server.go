@@ -1,4 +1,4 @@
-// Package api serves the local newline-delimited JSON protocol.
+// Package api serves the local newline-delimited JSON protocol and scheduler stream.
 package api
 
 import (
@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,14 +16,13 @@ import (
 	"time"
 
 	"github.com/gisikw/familiar-services/internal/attention"
-	"github.com/gisikw/familiar-services/internal/wakes"
-	"github.com/gisikw/familiar-services/internal/worklist"
+	"github.com/gisikw/familiar-services/internal/scheduler"
 )
 
 type Services struct {
-	Attention *attention.Store
-	Worklist  *worklist.Store
-	Wakes     *wakes.Store
+	Attention     *attention.Store
+	Scheduler     *scheduler.Store
+	DefaultTarget string
 }
 type request struct {
 	Op   string         `json:"op"`
@@ -37,32 +37,48 @@ type wireError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
-type Server struct {
-	socket   string
-	services Services
-	ln       net.Listener
-	wg       sync.WaitGroup
+type client struct {
+	net.Conn
+	target string
+	enc    *json.Encoder
+	mu     sync.Mutex
 }
 
-func New(socket string, s Services) *Server { return &Server{socket: socket, services: s} }
+func (c *client) send(v any) error { c.mu.Lock(); defer c.mu.Unlock(); return c.enc.Encode(v) }
+
+type Server struct {
+	socket       string
+	services     Services
+	ln           net.Listener
+	wg           sync.WaitGroup
+	mu           sync.Mutex
+	clients      map[string]*client
+	lastDelivery map[string]time.Time
+	latest       string
+	wake         chan struct{}
+}
+
+func New(socket string, services Services) *Server {
+	return &Server{socket: socket, services: services, clients: map[string]*client{}, lastDelivery: map[string]time.Time{}, wake: make(chan struct{}, 1)}
+}
 func (s *Server) Listen() error {
 	if s.socket == "" {
 		return errors.New("socket path is required")
 	}
-	if e := os.MkdirAll(filepath.Dir(s.socket), 0700); e != nil {
-		return e
+	if err := os.MkdirAll(filepath.Dir(s.socket), 0700); err != nil {
+		return err
 	}
-	if st, e := os.Lstat(s.socket); e == nil {
+	if st, err := os.Lstat(s.socket); err == nil {
 		if st.Mode()&os.ModeSocket == 0 {
 			return fmt.Errorf("refusing to replace non-socket %s", s.socket)
 		}
-		if e = os.Remove(s.socket); e != nil {
-			return e
+		if err = os.Remove(s.socket); err != nil {
+			return err
 		}
 	}
-	ln, e := net.Listen("unix", s.socket)
-	if e != nil {
-		return e
+	ln, err := net.Listen("unix", s.socket)
+	if err != nil {
+		return err
 	}
 	_ = os.Chmod(s.socket, 0600)
 	s.ln = ln
@@ -70,129 +86,243 @@ func (s *Server) Listen() error {
 }
 func (s *Server) Serve(ctx context.Context) error {
 	if s.ln == nil {
-		if e := s.Listen(); e != nil {
-			return e
+		if err := s.Listen(); err != nil {
+			return err
 		}
 	}
-	go func() { <-ctx.Done(); _ = s.ln.Close() }()
+	go s.deliveryLoop(ctx)
+	go func() {
+		<-ctx.Done()
+		_ = s.ln.Close()
+		s.mu.Lock()
+		for _, c := range s.clients {
+			_ = c.Close()
+		}
+		s.mu.Unlock()
+	}()
 	defer os.Remove(s.socket)
 	for {
-		c, e := s.ln.Accept()
-		if e != nil {
+		conn, err := s.ln.Accept()
+		if err != nil {
 			if ctx.Err() != nil {
 				s.wg.Wait()
 				return nil
 			}
-			return e
+			return err
 		}
 		s.wg.Add(1)
-		go func() { defer s.wg.Done(); defer c.Close(); s.connection(c) }()
+		go func() { defer s.wg.Done(); s.connection(conn) }()
 	}
 }
-func (s *Server) connection(c net.Conn) {
-	scan := bufio.NewScanner(c)
+func (s *Server) connection(conn net.Conn) {
+	c := &client{Conn: conn, enc: json.NewEncoder(conn)}
+	defer func() { s.unregister(c); conn.Close() }()
+	scan := bufio.NewScanner(conn)
 	scan.Buffer(make([]byte, 4096), 1024*1024)
-	enc := json.NewEncoder(c)
 	for scan.Scan() {
 		var r request
 		dec := json.NewDecoder(strings.NewReader(scan.Text()))
 		dec.UseNumber()
-		if e := dec.Decode(&r); e != nil {
-			_ = enc.Encode(failure("invalid_request", e.Error()))
+		if err := dec.Decode(&r); err != nil {
+			_ = c.send(failure("invalid_request", err.Error()))
 			continue
 		}
 		if r.Args == nil {
 			r.Args = map[string]any{}
 		}
-		v, e := s.dispatch(r)
-		if e != nil {
-			code := "unavailable"
-			var ce *attention.CodedError
-			if errors.As(e, &ce) {
-				code = ce.Code
+		if r.Op == "hello" {
+			instance, _ := r.Args["instance"].(string)
+			if !scheduler.ValidTarget("instance:" + instance) {
+				_ = c.send(failure("invalid_request", "valid instance is required"))
+				continue
 			}
-			if errors.Is(e, os.ErrNotExist) {
-				code = "not_found"
-			}
-			_ = enc.Encode(failure(code, e.Error()))
+			s.register(c, "instance:"+instance)
+			_ = s.services.Scheduler.Requeue(c.target)
+			_ = c.send(response{OK: true, Result: map[string]any{"target": c.target}})
+			s.signal()
 			continue
 		}
-		_ = enc.Encode(response{OK: true, Result: v})
+		v, err := s.dispatch(r, c.target)
+		if err != nil {
+			code := "unavailable"
+			var ce *attention.CodedError
+			if errors.As(err, &ce) {
+				code = ce.Code
+			}
+			if errors.Is(err, os.ErrNotExist) {
+				code = "not_found"
+			}
+			_ = c.send(failure(code, err.Error()))
+			continue
+		}
+		_ = c.send(response{OK: true, Result: v})
+		if r.Op == "schedule.enqueue" || r.Op == "notify" || r.Op == "schedule.ack" || r.Op == "dnd.set" {
+			s.signal()
+		}
+	}
+}
+func (s *Server) register(c *client, target string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if old := s.clients[target]; old != nil && old != c {
+		_ = old.Close()
+	}
+	c.target = target
+	s.clients[target] = c
+	delete(s.lastDelivery, target) // reconnect redelivery is immediate
+	s.latest = target
+}
+func (s *Server) unregister(c *client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.clients[c.target] == c {
+		delete(s.clients, c.target)
+	}
+}
+func (s *Server) defaultTarget() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if x := scheduler.NormalizeTarget(s.services.DefaultTarget); x != "" {
+		return x
+	}
+	return s.latest
+}
+func (s *Server) signal() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+func (s *Server) deliveryLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-s.wake:
+		}
+		s.pump()
+	}
+}
+func (s *Server) pump() {
+	s.mu.Lock()
+	clients := make([]*client, 0, len(s.clients))
+	for _, c := range s.clients {
+		if time.Since(s.lastDelivery[c.target]) >= 15*time.Second {
+			clients = append(clients, c)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range clients {
+		e, err := s.services.Scheduler.Claim(c.target, time.Now().UnixMilli())
+		if err != nil {
+			log.Printf("scheduler delivery: %v", err)
+			continue
+		}
+		if e != nil {
+			s.mu.Lock()
+			s.lastDelivery[c.target] = time.Now()
+			s.mu.Unlock()
+			if c.send(map[string]any{"event": e}) != nil {
+				_ = c.Close()
+			}
+		}
 	}
 }
 func failure(code, msg string) response { return response{OK: false, Error: &wireError{code, msg}} }
-func (s *Server) dispatch(r request) (any, error) {
+
+func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 	op := strings.TrimPrefix(r.Op, "attn.")
 	if isAttention(op) {
 		return s.services.Attention.Handle(op, r.Args)
 	}
 	switch r.Op {
-	case "worklist.list":
-		return s.services.Worklist.List()
-	case "worklist.enqueue":
-		var in worklist.Enqueue
-		if e := decode(r.Args, &in); e != nil {
-			return nil, e
+	case "schedule.enqueue", "notify":
+		var in scheduler.Enqueue
+		if err := decode(r.Args, &in); err != nil {
+			return nil, err
 		}
-		x, created, e := s.services.Worklist.Enqueue(in)
-		if e == nil {
-			s.services.Wakes.FreshInput(time.Now().UnixMilli())
+		if in.Target == "" {
+			if in.Origin != "" {
+				in.Target = "instance:" + in.Origin
+			} else if connectedTarget != "" {
+				in.Target = connectedTarget
+			} else {
+				in.Target = s.defaultTarget()
+			}
 		}
-		return map[string]any{"item": x, "created": created}, e
-	case "worklist.ack":
+		e, created, err := s.services.Scheduler.Enqueue(in)
+		if err == nil && strings.HasPrefix(e.Target, "spawn:") {
+			log.Printf("spawn targets land in M3: %s", e.Target)
+		}
+		return map[string]any{"event": e, "created": created}, err
+	case "schedule.list":
+		target, _ := r.Args["target"].(string)
+		if target == "" {
+			origin, _ := r.Args["origin"].(string)
+			if origin != "" {
+				target = "instance:" + origin
+			} else if connectedTarget != "" {
+				target = connectedTarget
+			} else {
+				target = s.defaultTarget()
+			}
+		}
+		return s.services.Scheduler.List(target)
+	case "schedule.cancel":
 		id, _ := r.Args["id"].(string)
 		if id == "" {
 			return nil, errors.New("id is required")
 		}
-		return s.services.Worklist.Ack(id)
-	case "worklist.withdraw":
+		ok, err := s.services.Scheduler.Cancel(id)
+		return map[string]any{"cancelled": ok}, err
+	case "schedule.ack":
 		id, _ := r.Args["id"].(string)
-		if id == "" {
-			return nil, errors.New("id is required")
+		if id == "" || connectedTarget == "" {
+			return nil, errors.New("ack requires hello and id")
 		}
-		return s.services.Worklist.Withdraw(id)
+		ok, err := s.services.Scheduler.Ack(id, connectedTarget)
+		if err == nil && !ok {
+			return nil, os.ErrNotExist
+		}
+		return map[string]any{"acked": ok}, err
 	case "dnd.get":
-		return s.services.Worklist.DNDGet()
+		target := requestTarget(r.Args, connectedTarget, s.defaultTarget())
+		return s.services.Scheduler.DNDGet(target)
 	case "dnd.set":
+		target := requestTarget(r.Args, connectedTarget, s.defaultTarget())
 		enabled := true
 		if x, ok := r.Args["enabled"].(bool); ok {
 			enabled = x
 		}
 		setBy, _ := r.Args["set_by"].(string)
-		if setBy == "" {
-			setBy, _ = r.Args["setBy"].(string)
-		}
-		var d *int64
+		var duration *int64
 		if x, ok := number(r.Args["duration_ms"]); ok {
-			d = &x
+			duration = &x
 		}
-		return s.services.Worklist.DNDSet(enabled, setBy, d)
-	case "wake.schedule", "wakes.schedule":
-		mode, _ := r.Args["mode"].(string)
-		reason, _ := r.Args["reason"].(string)
-		fire, ok := number(r.Args["fire_at"])
-		if !ok {
-			mins, mok := float(r.Args["duration_minutes"])
-			if !mok {
-				return nil, errors.New("duration_minutes or fire_at is required")
-			}
-			fire = time.Now().UnixMilli() + int64(mins*60000)
-		}
-		return s.services.Wakes.Schedule(mode, reason, fire)
-	case "wake.cancel", "wakes.cancel":
-		id, _ := r.Args["id"].(string)
-		ok, e := s.services.Wakes.Cancel(id)
-		return map[string]any{"cancelled": ok}, e
-	case "wake.list", "wakes.list":
-		return s.services.Wakes.List()
+		return s.services.Scheduler.DNDSet(target, enabled, setBy, duration)
 	default:
 		return nil, &attention.CodedError{Code: "invalid_request", Err: errors.New("unknown operation")}
 	}
 }
-func decode(v any, out any) error {
-	b, e := json.Marshal(v)
-	if e != nil {
-		return e
+func requestTarget(args map[string]any, connected, fallback string) string {
+	if x, _ := args["target"].(string); x != "" {
+		return x
+	}
+	if x, _ := args["origin"].(string); x != "" {
+		return "instance:" + x
+	}
+	if connected != "" {
+		return connected
+	}
+	return fallback
+}
+func decode(v, out any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
 	}
 	return json.Unmarshal(b, out)
 }
@@ -207,18 +337,6 @@ func number(v any) (int64, bool) {
 		return x, true
 	case int:
 		return int64(x), true
-	}
-	return 0, false
-}
-func float(v any) (float64, bool) {
-	switch x := v.(type) {
-	case json.Number:
-		n, e := x.Float64()
-		return n, e == nil
-	case float64:
-		return x, true
-	case int:
-		return float64(x), true
 	}
 	return 0, false
 }

@@ -7,8 +7,7 @@ import (
 	"testing"
 
 	"github.com/gisikw/familiar-services/internal/attention"
-	"github.com/gisikw/familiar-services/internal/wakes"
-	"github.com/gisikw/familiar-services/internal/worklist"
+	"github.com/gisikw/familiar-services/internal/scheduler"
 )
 
 // This compatibility test never opens production state. It first copies each
@@ -57,21 +56,17 @@ func TestCopiesOfRealStores(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	work, e := worklist.Open(stateCopy)
+	sched, e := scheduler.Open(stateCopy)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if _, e = work.List(); e != nil {
-		t.Fatalf("read copied worklist: %v", e)
+	defer sched.Close()
+	if _, e = sched.Migrate(stateCopy, "real-data-test"); e != nil {
+		t.Fatalf("migrate copied stores: %v", e)
 	}
-	wake, e := wakes.Open(stateCopy, work)
-	if e != nil {
-		t.Fatalf("read copied wakes: %v", e)
+	if _, e = sched.List("instance:real-data-test"); e != nil {
+		t.Fatalf("read migrated events: %v", e)
 	}
-	if _, e = wake.List(); e != nil {
-		t.Fatal(e)
-	}
-	wake.Close()
 }
 func copyFile(t *testing.T, src, dst string) {
 	t.Helper()

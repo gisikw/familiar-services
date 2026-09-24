@@ -3,7 +3,7 @@
 The singleton layer of Familiar: everything that must exist **exactly once**
 regardless of how many Familiar Pi processes are running.
 
-> Status: Milestone 2 adds the long-lived local service for Attention, worklist/DND, and durable wakes; the M0 continuity mirror remains available.
+> Status: Milestone 2 adds the long-lived local service for Attention and the unified event scheduler; the M0 continuity mirror remains available.
 
 ## Why this exists
 
@@ -20,7 +20,7 @@ sees the same world through the same interface.
   familiar-services  <──── imp (agentic CLI; the only way a Pi touches singletons)
   ├─ continuity   append-only turn graph (the record of us)
   ├─ attention    what wants Kevin's or Kes's attention, incl. "fork ready to merge"
-  ├─ wakes        durable scheduled wakes
+  ├─ scheduler    durable notifications, future wakes, delivery, and DND
   ├─ fleet        workbox hosts via Herdr (Pi / Claude / Codex)
   ├─ projects     project viewer, probably folds into fleet
   └─ router       inference routing (née tiamat-router)
