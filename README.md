@@ -3,7 +3,7 @@
 The singleton layer of Familiar: everything that must exist **exactly once**
 regardless of how many Familiar Pi processes are running.
 
-> Status: Milestone 0 provides a read-only continuity mirror and its NixOS import units.
+> Status: Milestone 2 adds the long-lived local service for Attention, worklist/DND, and durable wakes; the M0 continuity mirror remains available.
 
 ## Why this exists
 
