@@ -2,7 +2,7 @@
 
 | Service | Comes from |
 |---|---|
-| continuity | `familiar/packages/continuity` (handoffs, canon); Pi session JSONL for backfill |
+| continuity | handoffs from `familiar/packages/continuity` (retire the file store); Pi session JSONL for backfill. Canon/identity does **not** migrate here: it stays a config-pointed file/dir |
 | attention | `familiar/integrations/pi/extensions/worklist` (policy, store, DND); `imp attn` |
 | wakes | the wake tool's durable registry in the Pi integration |
 | fleet | `familiar-fleet`, golem capabilities/dispatch, `imp agent` |

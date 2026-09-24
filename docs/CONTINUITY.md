@@ -11,7 +11,8 @@ See `schema/continuity.sql`.
 - **turns** — one row per turn: session, timestamp, role, kind.
 - **parts** — ordered, attributed pieces of a turn. A turn is not a blob of
   text; it is a list of parts each with a `source` (`user`, `assistant`,
-  `merge`, `handoff`, `wake`, `system`, `tool`, …).
+  `merge`, `handoff`, `wake`, `system`, `tool`, …). The system prompt a
+  session ran with is recorded as a `system` part of its turn 0.
 - **edges** — ancestry. A turn may have more than one parent.
 
 ## Edge types

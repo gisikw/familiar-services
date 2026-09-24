@@ -60,5 +60,15 @@ restartable without disturbing the others:
 
 - Is `projects` its own service or a view over `fleet`?
 - Router cutover: rename in place or run both until clients move?
-- Where does the canon/identity store live — here, or stay in
-  `familiar/packages/continuity`?
+
+## Identity vs continuity (decided 2026-09-23)
+
+Identity is not a service. It is whatever file or directory the Familiar
+config points to; Pi reads it at launch as its system prompt. There is no
+identity package.
+
+Continuity is the record. System prompts are persisted as turns like
+everything else, so historical identity is fully preserved in the registry:
+for any conversation you can see exactly which version of Kes was present.
+Handoffs likewise live only as turns (`handoff` parts + edges); no separate
+handoff files. Readable exports are derived from the registry if wanted.
