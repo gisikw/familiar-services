@@ -118,6 +118,16 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 	if strings.TrimSpace(in.Summary) == "" {
 		return Event{}, false, errors.New("summary is required")
 	}
+	if in.Type == "merge" {
+		var m struct {
+			Summary, ForkSessionID, ForkSessionFile, BranchEntryID, FirstEntryID, LastEntryID string
+			TurnCount                                                                         *int  `json:"turnCount"`
+			ForkedFurther                                                                     *bool `json:"forkedFurther"`
+		}
+		if json.Unmarshal([]byte(in.Body), &m) != nil || strings.TrimSpace(m.Summary) == "" || m.ForkSessionID == "" || m.ForkSessionFile == "" || m.BranchEntryID == "" || m.FirstEntryID == "" || m.LastEntryID == "" || m.TurnCount == nil || *m.TurnCount < 0 || m.ForkedFurther == nil {
+			return Event{}, false, errors.New("merge requires summary, forkSessionId/file, branch/first/last entry ids, turnCount, and forkedFurther")
+		}
+	}
 	priority := 2
 	if in.Priority != nil {
 		priority = *in.Priority

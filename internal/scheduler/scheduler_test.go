@@ -38,6 +38,17 @@ func TestDedupeAndLifecycle(t *testing.T) {
 		t.Fatalf("ack: %v %v", ok, err)
 	}
 }
+func TestMergeValidation(t *testing.T) {
+	s := openTest(t)
+	valid := `{"summary":"I finished","forkSessionId":"fork","forkSessionFile":"/tmp/fork.jsonl","branchEntryId":"branch","firstEntryId":"first","lastEntryId":"last","turnCount":2,"forkedFurther":false}`
+	if _, _, err := s.Enqueue(Enqueue{Target: "instance:parent", Type: "merge", Summary: "I finished", Body: valid}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Enqueue(Enqueue{Target: "instance:parent", Type: "merge", Summary: "bad", Body: `{}`}); err == nil {
+		t.Fatal("incomplete merge accepted")
+	}
+}
+
 func TestDNDHoldsThenReleases(t *testing.T) {
 	s := openTest(t)
 	_, _, _ = s.Enqueue(Enqueue{ID: "held", Target: "instance:a", Summary: "wait"})

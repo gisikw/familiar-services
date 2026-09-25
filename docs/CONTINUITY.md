@@ -54,6 +54,15 @@ that parent: this is Pi's durable representation of `/tree` navigation. A
 `branch_summary.fromId` remains faithfully available in the raw attributed part
 but is not treated as ancestry (it identifies the abandoned tip, not the split).
 
+After all files are scanned, reconciliation projects explicit peer lifecycle
+records. A `familiar.fork.v1` marker plus the fork header's `parentSession`
+links the first suffix turn to the recorded parent branch entry with a `fork`
+edge. A parent `familiar.merge.v1` custom message links to the recorded fork
+leaf with a `merge` edge and sets `parts.from_turn`. A
+`familiar.branch-close.v1` marker projects `kind='branch_close'`. References
+whose session/turn has not arrived remain unresolved and are retried on every
+import pass; the importer never substitutes a timestamp or nearest leaf.
+
 ### System prompts
 
 The Familiar Pi extension records the exact system prompt in a Pi custom entry

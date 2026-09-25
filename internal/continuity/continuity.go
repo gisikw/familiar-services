@@ -66,8 +66,9 @@ type systemPromptData struct {
 }
 
 type message struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	CustomType string          `json:"customType"`
 }
 
 type fileState struct {
@@ -132,6 +133,9 @@ func Import(opts ImportOptions) error {
 		if opts.StopAfter > 0 && processed >= opts.StopAfter {
 			return ErrStopped
 		}
+	}
+	if err := reconcileBranches(db); err != nil {
+		return err
 	}
 	if err := importHandoffs(db, opts.HandoffsDir); err != nil {
 		return err
@@ -415,6 +419,10 @@ func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, lineOffset, 
 			if role == "toolResult" || role == "bashExecution" {
 				source = "tool"
 			}
+			if m.CustomType != "" {
+				role = "custom"
+				source = "pi:custom_message"
+			}
 			if len(m.Content) > 0 {
 				if m.Content[0] == '[' {
 					_ = json.Unmarshal(m.Content, &blocks)
@@ -489,6 +497,102 @@ func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, lineOffset, 
 	_, err = tx.Exec(`UPDATE import_state SET inode=?,size=?,mtime_ns=?,byte_offset=?,last_entry_id=?,imported_at=? WHERE path=?`, inode, size, mtime, offset, e.ID, now(), path)
 	if err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+// reconcileBranches projects cross-file facts after every scan. Unresolved
+// references are deliberately left absent; a later import pass retries them.
+func reconcileBranches(db *sql.DB) error {
+	rows, err := db.Query(`SELECT t.id,t.session_id,t.seq,t.meta_json,s.meta_json FROM turns t JOIN sessions s ON s.id=t.session_id ORDER BY t.session_id,t.seq`)
+	if err != nil {
+		return err
+	}
+	type item struct {
+		id, sid       string
+		seq           int
+		entry, header map[string]any
+	}
+	var items []item
+	for rows.Next() {
+		var x item
+		var eraw, hraw string
+		if err = rows.Scan(&x.id, &x.sid, &x.seq, &eraw, &hraw); err != nil {
+			rows.Close()
+			return err
+		}
+		_ = json.Unmarshal([]byte(eraw), &x.entry)
+		_ = json.Unmarshal([]byte(hraw), &x.header)
+		items = append(items, x)
+	}
+	rows.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for i, x := range items {
+		ct, _ := x.entry["customType"].(string)
+		if ct == "familiar.branch-close.v1" {
+			if _, err = tx.Exec(`UPDATE turns SET kind='branch_close' WHERE id=?`, x.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if ct == "familiar.fork.v1" {
+			// A nested fork inherits older markers in its immutable prefix; only
+			// this session's final marker describes its own cross-session edge.
+			newer := false
+			for j := i + 1; j < len(items) && items[j].sid == x.sid; j++ {
+				if c, _ := items[j].entry["customType"].(string); c == "familiar.fork.v1" {
+					newer = true
+					break
+				}
+			}
+			if newer {
+				continue
+			}
+			data, _ := x.entry["data"].(map[string]any)
+			parent, _ := data["parentSessionId"].(string)
+			branch, _ := data["branchEntryId"].(string)
+			if parent == "" {
+				if p, _ := x.header["parentSession"].(string); p != "" {
+					_ = tx.QueryRow(`SELECT id FROM sessions WHERE source_path=?`, p).Scan(&parent)
+					parent = strings.TrimPrefix(parent, "pi:")
+				}
+			}
+			if parent != "" && branch != "" {
+				if _, err = tx.Exec(`INSERT OR IGNORE INTO edges(child_id,parent_id,edge_type,inferred) SELECT ?,?,'fork',0 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)`, x.id, "pi:"+parent+":"+branch, "pi:"+parent+":"+branch); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if typ, _ := x.entry["type"].(string); typ == "message" || typ == "custom_message" {
+			msg, _ := x.entry["message"].(map[string]any)
+			if typ == "custom_message" && msg == nil {
+				msg = x.entry
+			}
+			if c, _ := msg["customType"].(string); c != "familiar.merge.v1" {
+				continue
+			}
+			details, _ := msg["details"].(map[string]any)
+			fork, _ := details["forkSessionId"].(string)
+			last, _ := details["lastEntryId"].(string)
+			from := "pi:" + fork + ":" + last
+			if fork != "" && last != "" {
+				var exists int
+				_ = tx.QueryRow(`SELECT count(*) FROM turns WHERE id=?`, from).Scan(&exists)
+				if exists > 0 {
+					if _, err = tx.Exec(`INSERT OR IGNORE INTO edges(child_id,parent_id,edge_type,inferred) VALUES(?,?,'merge',0)`, x.id, from); err != nil {
+						return err
+					}
+					if _, err = tx.Exec(`UPDATE parts SET from_turn=? WHERE turn_id=?`, from, x.id); err != nil {
+						return err
+					}
+				}
+			}
+		}
 	}
 	return tx.Commit()
 }
