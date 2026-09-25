@@ -522,6 +522,9 @@ func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, lineOffset, 
 // reconcileBranches projects cross-file facts after every scan. Unresolved
 // references are deliberately left absent; a later import pass retries them.
 func reconcileBranches(db *sql.DB) error {
+	if err := reconcileForkPrefixes(db); err != nil {
+		return err
+	}
 	rows, err := db.Query(`SELECT t.id,t.session_id,t.seq,t.meta_json,s.meta_json FROM turns t JOIN sessions s ON s.id=t.session_id ORDER BY t.session_id,t.seq`)
 	if err != nil {
 		return err
@@ -613,6 +616,196 @@ func reconcileBranches(db *sql.DB) error {
 		}
 	}
 	return tx.Commit()
+}
+
+type forkTurn struct {
+	id, entryID, parentID, customType string
+	data                              map[string]any
+}
+
+// reconcileForkPrefixes removes the path copied by SessionManager when it
+// creates a branched session. The parent must be present: otherwise the fork is
+// removed from the derived index and retried on a later pass.
+func reconcileForkPrefixes(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id,source_path,meta_json FROM sessions ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	type session struct{ id, path, meta string }
+	var sessions []session
+	for rows.Next() {
+		var s session
+		if err = rows.Scan(&s.id, &s.path, &s.meta); err != nil {
+			rows.Close()
+			return err
+		}
+		sessions = append(sessions, s)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+
+	for _, s := range sessions {
+		var h header
+		_ = json.Unmarshal([]byte(s.meta), &h)
+		turnRows, err := db.Query(`SELECT id,meta_json FROM turns WHERE session_id=? ORDER BY seq`, s.id)
+		if err != nil {
+			return err
+		}
+		var turns []forkTurn
+		marker := -1
+		for turnRows.Next() {
+			var t forkTurn
+			var raw string
+			if err = turnRows.Scan(&t.id, &raw); err != nil {
+				turnRows.Close()
+				return err
+			}
+			var e entry
+			if json.Unmarshal([]byte(raw), &e) == nil && e.Type != "session" {
+				t.entryID, t.customType = e.ID, e.CustomType
+				if e.ParentID != nil {
+					t.parentID = *e.ParentID
+				}
+				_ = json.Unmarshal(e.Data, &t.data)
+			}
+			turns = append(turns, t)
+			if t.customType == "familiar.fork.v1" {
+				marker = len(turns) - 1 // The final marker belongs to this fork.
+			}
+		}
+		if err = turnRows.Close(); err != nil {
+			return err
+		}
+		if marker < 0 && h.Parent == "" {
+			continue
+		}
+
+		parentSID := ""
+		if marker >= 0 {
+			if parent, _ := turns[marker].data["parentSessionId"].(string); parent != "" {
+				parentSID = "pi:" + parent
+			}
+		}
+		var parentPath string
+		if parentSID != "" {
+			err = db.QueryRow(`SELECT source_path FROM sessions WHERE id=?`, parentSID).Scan(&parentPath)
+		} else {
+			err = db.QueryRow(`SELECT id,source_path FROM sessions WHERE source_path=?`, h.Parent).Scan(&parentSID, &parentPath)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			// Do not guess which copied entries are inherited. Removing both the
+			// session and checkpoint makes the unchanged file retryable.
+			tx, e := db.Begin()
+			if e != nil {
+				return e
+			}
+			if _, e = tx.Exec(`DELETE FROM sessions WHERE id=?`, s.id); e == nil {
+				_, e = tx.Exec(`DELETE FROM import_state WHERE path=?`, s.path)
+			}
+			if e == nil {
+				_, e = tx.Exec(`DELETE FROM import_errors WHERE path=?`, s.path)
+			}
+			if e != nil {
+				tx.Rollback()
+				return e
+			}
+			if e = tx.Commit(); e != nil {
+				return e
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if marker >= 0 {
+			hasPrefix := false
+			for i := 0; i < marker; i++ {
+				hasPrefix = hasPrefix || turns[i].entryID != ""
+			}
+			if !hasPrefix { // Already cleaned on an earlier reconciliation.
+				continue
+			}
+		}
+		parentIDs, err := piEntryIDs(parentPath)
+		if err != nil {
+			return fmt.Errorf("read parent session %s: %w", parentPath, err)
+		}
+
+		limit := len(turns)
+		if marker >= 0 {
+			limit = marker
+		}
+		var inherited []string
+		firstOwn := marker
+		for i := 0; i < limit; i++ {
+			if turns[i].entryID == "" { // Header system-prompt pseudo-turn.
+				continue
+			}
+			if parentIDs[turns[i].entryID] {
+				inherited = append(inherited, turns[i].id)
+				continue
+			}
+			if marker < 0 { // Without a marker, only the shared leading path is inherited.
+				firstOwn = i
+				break
+			}
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		for _, id := range inherited {
+			if _, err = tx.Exec(`DELETE FROM turns WHERE id=?`, id); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		// Header-only Pi forks have no Familiar marker. Their first non-shared
+		// entry's parentId is the recorded branch point.
+		if marker < 0 && firstOwn >= 0 && firstOwn < len(turns) && turns[firstOwn].parentID != "" {
+			parent := parentSID + ":" + turns[firstOwn].parentID
+			if _, err = tx.Exec(`INSERT OR IGNORE INTO edges(child_id,parent_id,edge_type,inferred) SELECT ?,?,'fork',0 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)`, turns[firstOwn].id, parent, parent); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func piEntryIDs(path string) (map[string]bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	ids := make(map[string]bool)
+	r := bufio.NewReader(f)
+	for {
+		line, readErr := r.ReadBytes('\n')
+		if readErr == io.EOF && len(line) > 0 {
+			break // Ignore the source's incomplete trailing record.
+		}
+		if readErr != nil && readErr != io.EOF {
+			return nil, readErr
+		}
+		if len(line) == 0 {
+			break
+		}
+		var e entry
+		if json.Unmarshal(bytes.TrimSpace(line), &e) == nil && e.Type != "session" && e.ID != "" {
+			ids[e.ID] = true
+		}
+		if readErr == io.EOF {
+			break
+		}
+	}
+	return ids, nil
 }
 
 func validateSystemPrompt(raw json.RawMessage) error {

@@ -58,10 +58,13 @@ that parent: this is Pi's durable representation of `/tree` navigation. A
 but is not treated as ancestry (it identifies the abandoned tip, not the split).
 
 After all files are scanned, reconciliation projects explicit peer lifecycle
-records. A `familiar.fork.v1` marker plus the fork header's `parentSession`
-links the first suffix turn to the recorded parent branch entry with a `fork`
-edge. A parent `familiar.merge.v1` custom message links to the recorded fork
-leaf with a `merge` edge and sets `parts.from_turn`. For historical compatibility only, a `familiar.branch-close.v1` marker projects `kind='branch_close'`; current writers never emit one. References
+records. Pi branch files copy the parent's path with the same entry IDs; entries
+in that prefix are inherited and are not stored again under the fork session.
+A `familiar.fork.v1` marker (or the fork header's `parentSession`) links the
+first suffix turn to the recorded parent branch entry with a `fork` edge. If the
+parent has not arrived, the fork is deferred and retried on a later pass rather
+than guessing. A parent `familiar.merge.v1` custom message links to the recorded
+fork leaf with a `merge` edge and sets `parts.from_turn`. For historical compatibility only, a `familiar.branch-close.v1` marker projects `kind='branch_close'`; current writers never emit one. References
 whose session/turn has not arrived remain unresolved and are retried on every
 import pass; the importer never substitutes a timestamp or nearest leaf.
 
