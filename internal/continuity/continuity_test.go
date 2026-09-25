@@ -294,7 +294,7 @@ func TestNonPiJSONLIsSkipped(t *testing.T) {
 	os.MkdirAll(handoffs, 0o755)
 	path := filepath.Join(sessions, "fork", "log.jsonl")
 	os.WriteFile(path, []byte("{\"type\":\"log\",\"message\":\"started\"}\n{not an entry}\n"), 0o644)
-	opts := ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: filepath.Join(root, "db")}
+	opts := ImportOptions{SessionsDirs: []string{sessions}, HandoffsDir: handoffs, DBPath: filepath.Join(root, "db")}
 	if err := Import(opts); err != nil {
 		t.Fatal(err)
 	}
