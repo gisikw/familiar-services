@@ -41,3 +41,20 @@ sees the same world through the same interface.
 - Go, stdlib-first, SQLite. Nix flake for build and devshell.
 
 See `docs/ROADMAP.md` for the milestone sequence, plus `docs/ARCHITECTURE.md`, `docs/CONTINUITY.md`, and `docs/MIGRATION.md`.
+
+## Apple Push Notifications
+
+The newline-delimited JSON service protocol supports these APNs operations:
+
+- `push.register` — arguments `{ "token": "<hex>", "platform": "ios", "label"?: "Kevin's iPhone" }`; registers a device idempotently and returns `{ "registered": true }`.
+- `push.send` — arguments `{ "title"?: "...", "body": "...", "threadId"?: "...", "sound"?: true }`; sends an alert to every registered device and returns `{ "sent": n, "failed": n }`. `sound` defaults to `true`.
+
+APNs uses the production endpoint by default, including for ad-hoc builds. Configure it with:
+
+- `FAMILIAR_APNS_KEY_FILE`: path to the Apple PKCS#8 `.p8` P-256 private key
+- `FAMILIAR_APNS_KEY_ID`: Apple key ID
+- `FAMILIAR_APNS_TEAM_ID`: Apple developer team ID
+- `FAMILIAR_APNS_TOPIC`: app bundle ID (for example `network.gisi.familiar`)
+- `FAMILIAR_APNS_HOST`: optional endpoint override; defaults to `https://api.push.apple.com`
+
+Missing or unreadable APNs configuration does not prevent service startup. Push operations then return an `unavailable` error; all other operations continue normally.

@@ -16,12 +16,14 @@ import (
 	"time"
 
 	"github.com/gisikw/familiar-services/internal/attention"
+	"github.com/gisikw/familiar-services/internal/push"
 	"github.com/gisikw/familiar-services/internal/scheduler"
 )
 
 type Services struct {
 	Attention     *attention.Store
 	Scheduler     *scheduler.Store
+	Push          *push.Service
 	DefaultTarget string
 }
 type request struct {
@@ -145,9 +147,13 @@ func (s *Server) connection(conn net.Conn) {
 		v, err := s.dispatch(r, c.target)
 		if err != nil {
 			code := "unavailable"
-			var ce *attention.CodedError
-			if errors.As(err, &ce) {
-				code = ce.Code
+			var attentionError *attention.CodedError
+			if errors.As(err, &attentionError) {
+				code = attentionError.Code
+			}
+			var pushError *push.CodedError
+			if errors.As(err, &pushError) {
+				code = pushError.Code
 			}
 			if errors.Is(err, os.ErrNotExist) {
 				code = "not_found"
@@ -237,6 +243,12 @@ func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 	op := strings.TrimPrefix(r.Op, "attn.")
 	if isAttention(op) {
 		return s.services.Attention.Handle(op, r.Args)
+	}
+	if r.Op == "push.register" || r.Op == "push.send" {
+		if s.services.Push == nil {
+			return nil, &push.CodedError{Code: "unavailable", Err: errors.New("APNs is unavailable")}
+		}
+		return s.services.Push.Handle(context.Background(), r.Op, r.Args)
 	}
 	switch r.Op {
 	case "schedule.enqueue", "notify":

@@ -13,6 +13,7 @@ import (
 	"github.com/gisikw/familiar-services/internal/api"
 	"github.com/gisikw/familiar-services/internal/attention"
 	"github.com/gisikw/familiar-services/internal/continuity"
+	"github.com/gisikw/familiar-services/internal/push"
 	"github.com/gisikw/familiar-services/internal/scheduler"
 )
 
@@ -52,9 +53,14 @@ func run(args []string) error {
 			return err
 		}
 		defer sched.Close()
+		pushService, err := push.Open(*stateDir)
+		if err != nil {
+			return err
+		}
+		defer pushService.Close()
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		return api.New(*socket, api.Services{Attention: attn, Scheduler: sched, DefaultTarget: *defaultTarget}).Serve(ctx)
+		return api.New(*socket, api.Services{Attention: attn, Scheduler: sched, Push: pushService, DefaultTarget: *defaultTarget}).Serve(ctx)
 	}
 	if len(args) > 0 && args[0] == "migrate" {
 		fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
