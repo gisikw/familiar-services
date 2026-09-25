@@ -34,8 +34,8 @@ sees the same world through the same interface.
   through `imp`. The gateway exposes the same capabilities over HTTP to clients.
 - **No privileged primary.** "Primary" is a convention, not a role. Forks are
   peers; precedence is decided at merge time.
-- **Every fork ends.** A branch closes by merging or by an explicit close
-  record. A branch that simply stops is a bug, and continuity reports it.
+- **Every fork comes home.** A branch ends only by merging. A fork that simply
+  stops is a bug, and continuity reports it; historical close records remain importable.
 - **Record faithfully, project cleanly.** Store what actually happened;
   derive clean views at read time.
 - Go, stdlib-first, SQLite. Nix flake for build and devshell.

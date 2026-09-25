@@ -36,8 +36,8 @@ A fork's life:
 1. `fork` edge from the turn it branched at.
 2. Works; may dispatch subagents via `fleet`.
 3. Raises an attention item: "ready to merge".
-4. Either writes a merge (a note injected into another live branch, recorded as
-   an attributed part plus a `merge` edge) or a `branch_close` turn.
+4. Writes a merge: a note injected into another live branch and recorded as an
+   attributed part plus a `merge` edge. Urgency controls whether it wakes that branch.
 
 Which branch is "primary" after concurrent work (for example local model on a
 plane versus server-side jobs) is decided at merge time, by Kevin and Kes.

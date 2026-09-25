@@ -42,7 +42,7 @@ Tracked as cards on the Attention board `familiar-services`.
 ### M4 — Peer forks and merge; Exo's briefing wake
 - Fork = new `familiar-pi@` unit branched from a turn; same prompt, tools, imp.
 - Clients may talk to live forks directly. Every fork ends in a recorded merge
-  (attributed part + `merge` edge) or `branch_close`; stale live leaves surface in Attention.
+  (attributed part + `merge` edge); stale live leaves surface in Attention.
 - Then retire the standalone daily-briefing (Kobold workflow in hoard) in favor of a
   scheduled wake that forks a Familiar to maintain the timeline, named for Exo.
 

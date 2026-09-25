@@ -40,7 +40,7 @@ func TestDedupeAndLifecycle(t *testing.T) {
 }
 func TestMergeValidation(t *testing.T) {
 	s := openTest(t)
-	valid := `{"summary":"I finished","forkSessionId":"fork","forkSessionFile":"/tmp/fork.jsonl","branchEntryId":"branch","firstEntryId":"first","lastEntryId":"last","turnCount":2,"forkedFurther":false}`
+	valid := `{"summary":"I finished","forkSessionId":"fork","forkSessionFile":"/tmp/fork.jsonl","branchEntryId":"branch","firstEntryId":"first","lastEntryId":"last","mergedAt":"2026-01-01T00:00:00Z","turnCount":2,"forkedFurther":false}`
 	if _, _, err := s.Enqueue(Enqueue{Target: "instance:parent", Type: "merge", Summary: "I finished", Body: valid}); err != nil {
 		t.Fatal(err)
 	}
@@ -59,6 +59,10 @@ func TestDNDHoldsThenReleases(t *testing.T) {
 	if e, err := s.Claim("instance:a", time.Now().UnixMilli()); err != nil || e != nil {
 		t.Fatalf("delivered under DND: %#v %v", e, err)
 	}
+	_, _, _ = s.Enqueue(Enqueue{ID: "soft", Target: "instance:a", Summary: "quiet", Urgency: "soft"})
+	if e, err := s.Claim("instance:a", time.Now().UnixMilli()); err != nil || e == nil || e.ID != "soft" || e.Urgency != "soft" {
+		t.Fatalf("soft event did not pass DND: %#v %v", e, err)
+	}
 	if _, err := s.DNDSet("instance:a", false, "familiar", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -66,6 +70,17 @@ func TestDNDHoldsThenReleases(t *testing.T) {
 		t.Fatalf("not released: %#v %v", e, err)
 	}
 }
+func TestUrgencyValidationAndDefault(t *testing.T) {
+	s := openTest(t)
+	e, _, err := s.Enqueue(Enqueue{Target: "instance:a", Summary: "default"})
+	if err != nil || e.Urgency != "wake" {
+		t.Fatalf("default: %#v %v", e, err)
+	}
+	if _, _, err = s.Enqueue(Enqueue{Target: "instance:a", Summary: "bad", Urgency: "now"}); err == nil {
+		t.Fatal("invalid urgency accepted")
+	}
+}
+
 func TestRoutingAndReconnectRequeue(t *testing.T) {
 	s := openTest(t)
 	_, _, _ = s.Enqueue(Enqueue{ID: "a-only", Target: "instance:a", Summary: "a"})

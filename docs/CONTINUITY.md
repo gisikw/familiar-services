@@ -13,6 +13,8 @@ familiar-services continuity stats --db FILE
 
 The importer recursively finds `.jsonl` files under every `--sessions` root;
 the option may be repeated (for example, for primary and fork session trees).
+A file whose first complete JSON line does not have `type: "session"` is counted
+as skipped rather than malformed; this excludes fork-local `log.jsonl` files.
 `import_state` records each absolute source path's inode, observed size and mtime,
 last committed byte offset, and last entry ID. Every complete JSONL line and its checkpoint are
 committed atomically. A final unterminated line is treated as an in-progress Pi
@@ -59,8 +61,7 @@ After all files are scanned, reconciliation projects explicit peer lifecycle
 records. A `familiar.fork.v1` marker plus the fork header's `parentSession`
 links the first suffix turn to the recorded parent branch entry with a `fork`
 edge. A parent `familiar.merge.v1` custom message links to the recorded fork
-leaf with a `merge` edge and sets `parts.from_turn`. A
-`familiar.branch-close.v1` marker projects `kind='branch_close'`. References
+leaf with a `merge` edge and sets `parts.from_turn`. For historical compatibility only, a `familiar.branch-close.v1` marker projects `kind='branch_close'`; current writers never emit one. References
 whose session/turn has not arrived remain unresolved and are retried on every
 import pass; the importer never substitutes a timestamp or nearest leaf.
 

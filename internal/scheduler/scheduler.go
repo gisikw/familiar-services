@@ -30,6 +30,7 @@ type Event struct {
 	Type      string `json:"type"`
 	Summary   string `json:"summary"`
 	Body      string `json:"body"`
+	Urgency   string `json:"urgency"`
 	State     string `json:"state"`
 	CreatedAt int64  `json:"created_at"`
 }
@@ -43,6 +44,7 @@ type Enqueue struct {
 	Type     string `json:"type"`
 	Summary  string `json:"summary"`
 	Body     string `json:"body"`
+	Urgency  string `json:"urgency"`
 }
 type DND struct {
 	Enabled   bool   `json:"enabled"`
@@ -72,8 +74,8 @@ func Open(stateDir string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS events (
 			id TEXT PRIMARY KEY, due_at INTEGER NOT NULL, target TEXT NOT NULL, origin TEXT NOT NULL,
 			source TEXT NOT NULL, priority INTEGER NOT NULL, type TEXT NOT NULL, summary TEXT NOT NULL,
-			body TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','delivered','acked')),
-			created_at INTEGER NOT NULL)`,
+			body TEXT NOT NULL, urgency TEXT NOT NULL DEFAULT 'wake' CHECK(urgency IN ('wake','soft')),
+			state TEXT NOT NULL CHECK(state IN ('pending','delivered','acked')), created_at INTEGER NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS events_delivery ON events(target,state,due_at,priority,created_at)`,
 		`CREATE TABLE IF NOT EXISTS dnd (target TEXT PRIMARY KEY, set_by TEXT NOT NULL, set_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
 	} {
@@ -81,6 +83,11 @@ func Open(stateDir string) (*Store, error) {
 			db.Close()
 			return nil, err
 		}
+	}
+	// Existing M2 databases predate urgency; SQLite has no ADD COLUMN IF NOT EXISTS.
+	if _, err = db.Exec(`ALTER TABLE events ADD COLUMN urgency TEXT NOT NULL DEFAULT 'wake' CHECK(urgency IN ('wake','soft'))`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, err
 	}
 	return &Store{db: db, now: time.Now}, nil
 }
@@ -120,12 +127,12 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 	}
 	if in.Type == "merge" {
 		var m struct {
-			Summary, ForkSessionID, ForkSessionFile, BranchEntryID, FirstEntryID, LastEntryID string
-			TurnCount                                                                         *int  `json:"turnCount"`
-			ForkedFurther                                                                     *bool `json:"forkedFurther"`
+			Summary, ForkSessionID, ForkSessionFile, BranchEntryID, FirstEntryID, LastEntryID, MergedAt string
+			TurnCount                                                                                   *int  `json:"turnCount"`
+			ForkedFurther                                                                               *bool `json:"forkedFurther"`
 		}
-		if json.Unmarshal([]byte(in.Body), &m) != nil || strings.TrimSpace(m.Summary) == "" || m.ForkSessionID == "" || m.ForkSessionFile == "" || m.BranchEntryID == "" || m.FirstEntryID == "" || m.LastEntryID == "" || m.TurnCount == nil || *m.TurnCount < 0 || m.ForkedFurther == nil {
-			return Event{}, false, errors.New("merge requires summary, forkSessionId/file, branch/first/last entry ids, turnCount, and forkedFurther")
+		if json.Unmarshal([]byte(in.Body), &m) != nil || strings.TrimSpace(m.Summary) == "" || m.ForkSessionID == "" || m.ForkSessionFile == "" || m.BranchEntryID == "" || m.FirstEntryID == "" || m.LastEntryID == "" || m.MergedAt == "" || m.TurnCount == nil || *m.TurnCount < 0 || m.ForkedFurther == nil {
+			return Event{}, false, errors.New("merge requires summary, forkSessionId/file, branch/first/last entry ids, mergedAt, turnCount, and forkedFurther")
 		}
 	}
 	priority := 2
@@ -134,6 +141,12 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 	}
 	if priority < 0 || priority > 3 {
 		return Event{}, false, errors.New("priority must be 0..3")
+	}
+	if in.Urgency == "" {
+		in.Urgency = "wake"
+	}
+	if in.Urgency != "wake" && in.Urgency != "soft" {
+		return Event{}, false, errors.New("urgency must be wake or soft")
 	}
 	now := s.now().UnixMilli()
 	if in.DueAt == 0 {
@@ -151,8 +164,8 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 	if in.Body == "" {
 		in.Body = in.Summary
 	}
-	e := Event{in.ID, in.DueAt, in.Target, in.Origin, in.Source, priority, in.Type, in.Summary, in.Body, "pending", now}
-	res, err := s.db.Exec(`INSERT OR IGNORE INTO events(id,due_at,target,origin,source,priority,type,summary,body,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,'pending',?)`, e.ID, e.DueAt, e.Target, e.Origin, e.Source, e.Priority, e.Type, e.Summary, e.Body, e.CreatedAt)
+	e := Event{ID: in.ID, DueAt: in.DueAt, Target: in.Target, Origin: in.Origin, Source: in.Source, Priority: priority, Type: in.Type, Summary: in.Summary, Body: in.Body, Urgency: in.Urgency, State: "pending", CreatedAt: now}
+	res, err := s.db.Exec(`INSERT OR IGNORE INTO events(id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)`, e.ID, e.DueAt, e.Target, e.Origin, e.Source, e.Priority, e.Type, e.Summary, e.Body, e.Urgency, e.CreatedAt)
 	if err != nil {
 		return Event{}, false, err
 	}
@@ -165,14 +178,14 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 }
 func scanEvent(row interface{ Scan(...any) error }) (Event, error) {
 	var e Event
-	err := row.Scan(&e.ID, &e.DueAt, &e.Target, &e.Origin, &e.Source, &e.Priority, &e.Type, &e.Summary, &e.Body, &e.State, &e.CreatedAt)
+	err := row.Scan(&e.ID, &e.DueAt, &e.Target, &e.Origin, &e.Source, &e.Priority, &e.Type, &e.Summary, &e.Body, &e.Urgency, &e.State, &e.CreatedAt)
 	return e, err
 }
 func (s *Store) Get(id string) (Event, error) {
-	return scanEvent(s.db.QueryRow(`SELECT id,due_at,target,origin,source,priority,type,summary,body,state,created_at FROM events WHERE id=?`, id))
+	return scanEvent(s.db.QueryRow(`SELECT id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at FROM events WHERE id=?`, id))
 }
 func (s *Store) List(target string) ([]Event, error) {
-	q := `SELECT id,due_at,target,origin,source,priority,type,summary,body,state,created_at FROM events WHERE state!='acked'`
+	q := `SELECT id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at FROM events WHERE state!='acked'`
 	args := []any{}
 	if target != "" {
 		q += ` AND target=?`
@@ -220,7 +233,7 @@ func (s *Store) Claim(target string, now int64) (*Event, error) {
 		return nil, nil
 	}
 	dnd, err := s.DNDGet(target)
-	if err != nil || dnd != nil {
+	if err != nil {
 		return nil, err
 	}
 	tx, err := s.db.Begin()
@@ -228,7 +241,11 @@ func (s *Store) Claim(target string, now int64) (*Event, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	e, err := scanEvent(tx.QueryRow(`SELECT id,due_at,target,origin,source,priority,type,summary,body,state,created_at FROM events WHERE target=? AND state='pending' AND due_at<=? ORDER BY priority,due_at,created_at LIMIT 1`, target, now))
+	query := `SELECT id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at FROM events WHERE target=? AND state='pending' AND due_at<=?`
+	if dnd != nil {
+		query += ` AND urgency='soft'`
+	}
+	e, err := scanEvent(tx.QueryRow(query+` ORDER BY priority,due_at,created_at LIMIT 1`, target, now))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

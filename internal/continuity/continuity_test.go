@@ -287,6 +287,34 @@ func TestCrashCheckpointResumes(t *testing.T) {
 	}
 }
 
+func TestNonPiJSONLIsSkipped(t *testing.T) {
+	root := t.TempDir()
+	sessions, handoffs := filepath.Join(root, "sessions"), filepath.Join(root, "handoffs")
+	os.MkdirAll(filepath.Join(sessions, "fork"), 0o755)
+	os.MkdirAll(handoffs, 0o755)
+	path := filepath.Join(sessions, "fork", "log.jsonl")
+	os.WriteFile(path, []byte("{\"type\":\"log\",\"message\":\"started\"}\n{not an entry}\n"), 0o644)
+	opts := ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: filepath.Join(root, "db")}
+	if err := Import(opts); err != nil {
+		t.Fatal(err)
+	}
+	db, _ := Open(opts.DBPath)
+	defer db.Close()
+	s, err := ReadStats(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Skipped != 1 || s.ImportErrors != 0 || s.Sessions != 0 {
+		t.Fatalf("stats=%#v", s)
+	}
+	if err = Import(opts); err != nil {
+		t.Fatal(err)
+	}
+	if got := count(t, db, `SELECT count(*) FROM import_state WHERE path=? AND session_id IS NULL`, path); got != 1 {
+		t.Fatalf("skipped state=%d", got)
+	}
+}
+
 func TestCompleteMalformedLineIsReported(t *testing.T) {
 	opts, db := setup(t)
 	path := filepath.Join(opts.SessionsDirs[0], "two.jsonl")

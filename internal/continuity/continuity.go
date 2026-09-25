@@ -306,6 +306,10 @@ func importFile(db *sql.DB, path string, remaining int) (int, error) {
 	if exists && size == state.Size && mtime == state.Mtime && state.Offset >= size {
 		return 0, nil
 	}
+	// A skipped non-session file is reconsidered from its first line if changed.
+	if exists && state.SessionID == "" {
+		state.Offset = 0
+	}
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -342,7 +346,11 @@ func importFile(db *sql.DB, path string, remaining int) (int, error) {
 		}
 		if sessionID == "" {
 			var h header
-			if json.Unmarshal(raw, &h) != nil || h.Type != "session" || h.ID == "" {
+			decodeErr := json.Unmarshal(raw, &h)
+			if decodeErr != nil || h.Type != "session" {
+				return count, skipFile(db, path, inode, size, mtime)
+			}
+			if h.ID == "" {
 				if err = recordError(db, path, start, "missing or invalid Pi session header", inode, size, mtime, offset, sessionID); err != nil {
 					return count, err
 				}
@@ -626,6 +634,23 @@ func validateSystemPrompt(raw json.RawMessage) error {
 	return nil
 }
 
+func skipFile(db *sql.DB, path string, inode, size, mtime int64) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`DELETE FROM import_errors WHERE path=?`, path); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO import_state(path,inode,size,mtime_ns,byte_offset,last_entry_id,session_id,imported_at) VALUES(?,?,?,?,?,NULL,NULL,?)
+		ON CONFLICT(path) DO UPDATE SET inode=excluded.inode,size=excluded.size,mtime_ns=excluded.mtime_ns,byte_offset=excluded.byte_offset,last_entry_id=NULL,session_id=NULL,imported_at=excluded.imported_at`, path, inode, size, mtime, size, now())
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func checkpoint(db *sql.DB, path string, inode, size, mtime, offset int64, last, sid string) error {
 	_, err := db.Exec(`UPDATE import_state SET inode=?,size=?,mtime_ns=?,byte_offset=?,last_entry_id=coalesce(nullif(?,''),last_entry_id),imported_at=? WHERE path=?`, inode, size, mtime, offset, last, now(), path)
 	return err
@@ -651,9 +676,9 @@ func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 // Stats is the compact set printed by the stats command.
 type Stats struct {
-	Sessions, Turns, Parts, SystemPrompts, LiveLeaves, ImportErrors int64
-	Edges                                                           map[string]int64
-	LastImport                                                      string
+	Sessions, Turns, Parts, SystemPrompts, LiveLeaves, Skipped, ImportErrors int64
+	Edges                                                                    map[string]int64
+	LastImport                                                               string
 }
 
 func ReadStats(db *sql.DB) (Stats, error) {
@@ -663,7 +688,7 @@ func ReadStats(db *sql.DB) (Stats, error) {
 		dst *int64
 	}{{`SELECT count(*) FROM sessions`, &s.Sessions}, {`SELECT count(*) FROM turns`, &s.Turns}, {`SELECT count(*) FROM parts`, &s.Parts},
 		{`SELECT count(DISTINCT json_extract(body_json,'$.data.sha256')) FROM parts WHERE source='system' AND json_extract(body_json,'$.customType')='familiar.system-prompt.v1'`, &s.SystemPrompts},
-		{`SELECT count(*) FROM live_branches`, &s.LiveLeaves}, {`SELECT count(*) FROM import_errors`, &s.ImportErrors}} {
+		{`SELECT count(*) FROM live_branches`, &s.LiveLeaves}, {`SELECT count(*) FROM import_state WHERE session_id IS NULL`, &s.Skipped}, {`SELECT count(*) FROM import_errors`, &s.ImportErrors}} {
 		if err := db.QueryRow(q.sql).Scan(q.dst); err != nil {
 			return s, err
 		}
@@ -888,6 +913,6 @@ func FormatStats(s Stats) string {
 		}
 		b.WriteByte('\n')
 	}
-	fmt.Fprintf(&b, "live leaves: %d\nimport errors: %d\nlast import: %s\n", s.LiveLeaves, s.ImportErrors, s.LastImport)
+	fmt.Fprintf(&b, "live leaves: %d\nskipped files: %d\nimport errors: %d\nlast import: %s\n", s.LiveLeaves, s.Skipped, s.ImportErrors, s.LastImport)
 	return b.String()
 }
