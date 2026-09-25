@@ -208,10 +208,13 @@ type sendInput struct {
 	Body     string
 	ThreadID string
 	Sound    bool
+	// Session is the sending Familiar instance (Pi session id); the phone
+	// opens that session on tap and falls back to the primary if it's gone.
+	Session string
 }
 
 func parseSend(args map[string]any) (sendInput, error) {
-	if !only(args, "title", "body", "threadId", "sound") {
+	if !only(args, "title", "body", "threadId", "sound", "session") {
 		return sendInput{}, coded("invalid_request", "invalid arguments")
 	}
 	var in sendInput
@@ -221,7 +224,12 @@ func parseSend(args map[string]any) (sendInput, error) {
 		return in, coded("invalid_request", "body is required and must be at most 1024 characters")
 	}
 	in.Body = body
-	for name, destination := range map[string]*string{"title": &in.Title, "threadId": &in.ThreadID} {
+	if value, exists := args["session"]; exists {
+		if x, ok := value.(string); !ok || len(x) > 128 || strings.ContainsAny(x, "/?#&= \t\r\n") {
+			return in, coded("invalid_request", "invalid session")
+		}
+	}
+	for name, destination := range map[string]*string{"title": &in.Title, "threadId": &in.ThreadID, "session": &in.Session} {
 		if value, exists := args[name]; exists {
 			x, ok := value.(string)
 			if !ok {
@@ -241,7 +249,8 @@ func parseSend(args map[string]any) (sendInput, error) {
 }
 
 type payload struct {
-	APS aps `json:"aps"`
+	APS     aps    `json:"aps"`
+	Session string `json:"session,omitempty"`
 }
 type aps struct {
 	Alert    alert  `json:"alert"`
@@ -279,7 +288,7 @@ func (s *Service) send(ctx context.Context, args map[string]any) (any, error) {
 		return nil, err
 	}
 
-	message := payload{APS: aps{Alert: alert{Title: in.Title, Body: in.Body}, ThreadID: in.ThreadID}}
+	message := payload{APS: aps{Alert: alert{Title: in.Title, Body: in.Body}, ThreadID: in.ThreadID}, Session: in.Session}
 	if in.Sound {
 		message.APS.Sound = "default"
 	}

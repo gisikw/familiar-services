@@ -121,7 +121,7 @@ func TestSendHTTP2HeadersAndPayload(t *testing.T) {
 	if _, err := s.Handle(context.Background(), "push.register", map[string]any{"token": device, "platform": "ios"}); err != nil {
 		t.Fatal(err)
 	}
-	result, err := s.Handle(context.Background(), "push.send", map[string]any{"title": "Hello", "body": "Kevin", "threadId": "familiar"})
+	result, err := s.Handle(context.Background(), "push.send", map[string]any{"title": "Hello", "body": "Kevin", "threadId": "familiar", "session": "01a0da45-0fb2-727c-830e-d3f295772c3b"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +144,18 @@ func TestSendHTTP2HeadersAndPayload(t *testing.T) {
 	alert := aps["alert"].(map[string]any)
 	if alert["title"] != "Hello" || alert["body"] != "Kevin" || aps["sound"] != "default" || aps["thread-id"] != "familiar" {
 		t.Fatalf("unexpected payload: %#v", got)
+	}
+	if got["session"] != "01a0da45-0fb2-727c-830e-d3f295772c3b" {
+		t.Fatalf("sending session not carried for tap deep link: %#v", got)
+	}
+}
+
+func TestSendRejectsUnsafeSession(t *testing.T) {
+	s, _ := configuredService(t, "https://127.0.0.1:1")
+	for _, bad := range []any{7, "a/b", "a?x", "has space", strings.Repeat("x", 129)} {
+		if _, err := s.Handle(context.Background(), "push.send", map[string]any{"body": "hi", "session": bad}); err == nil {
+			t.Fatalf("session %v accepted", bad)
+		}
 	}
 }
 
