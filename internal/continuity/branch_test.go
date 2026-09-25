@@ -6,11 +6,14 @@ import (
 	"testing"
 )
 
-func TestBranchReconciliationIsOrderIndependent(t *testing.T) {
+func TestBranchReconciliationAcrossSessionRoots(t *testing.T) {
 	root := t.TempDir()
 	sessions := filepath.Join(root, "sessions")
+	forks := filepath.Join(root, "state", "forks")
+	forkSessions := filepath.Join(forks, "fork-uuid", "sessions")
 	handoffs := filepath.Join(root, "handoffs")
 	os.MkdirAll(sessions, 0755)
+	os.MkdirAll(forkSessions, 0755)
 	os.MkdirAll(handoffs, 0755)
 	parent := `{"type":"session","version":3,"id":"parent","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}
 {"type":"message","id":"branch01","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"base"}}
@@ -27,11 +30,11 @@ func TestBranchReconciliationIsOrderIndependent(t *testing.T) {
 	// pending, then a second no-op pass resolves it without guessing.
 	os.WriteFile(filepath.Join(sessions, "parent.jsonl"), []byte(parent), 0644)
 	dbp := filepath.Join(root, "db")
-	opts := ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: dbp}
+	opts := ImportOptions{SessionsDirs: []string{sessions, forks}, HandoffsDir: handoffs, DBPath: dbp}
 	if err := Import(opts); err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(filepath.Join(sessions, "fork.jsonl"), []byte(fork), 0644)
+	os.WriteFile(filepath.Join(forkSessions, "fork.jsonl"), []byte(fork), 0644)
 	if err := Import(opts); err != nil {
 		t.Fatal(err)
 	}

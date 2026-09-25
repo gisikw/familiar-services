@@ -39,7 +39,7 @@ func setup(t *testing.T) (ImportOptions, *sql.DB) {
 	handoffs := filepath.Join(root, "handoffs")
 	copyTree(t, "testdata/sessions", sessions)
 	copyTree(t, "testdata/handoffs", handoffs)
-	opts := ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: filepath.Join(root, "continuity.db")}
+	opts := ImportOptions{SessionsDirs: []string{sessions}, HandoffsDir: handoffs, DBPath: filepath.Join(root, "continuity.db")}
 	if err := Import(opts); err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestSystemPromptCustomEntries(t *testing.T) {
 	if err := os.MkdirAll(handoffs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	opts := ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: filepath.Join(root, "continuity.db")}
+	opts := ImportOptions{SessionsDirs: []string{sessions}, HandoffsDir: handoffs, DBPath: filepath.Join(root, "continuity.db")}
 	if err := Import(opts); err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestSchemaVersionMismatchRebuilds(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
-	if err = Import(ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: dbPath}); err != nil {
+	if err = Import(ImportOptions{SessionsDirs: []string{sessions}, HandoffsDir: handoffs, DBPath: dbPath}); err != nil {
 		t.Fatal(err)
 	}
 	db, err = Open(dbPath)
@@ -202,7 +202,7 @@ func TestTruncatedTrailingLineWaitsForCompletion(t *testing.T) {
 	if err = os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	opts := ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: filepath.Join(root, "db")}
+	opts := ImportOptions{SessionsDirs: []string{sessions}, HandoffsDir: handoffs, DBPath: filepath.Join(root, "db")}
 	if err = Import(opts); err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestTruncatedTrailingLineWaitsForCompletion(t *testing.T) {
 
 func TestReplacementReimportsFile(t *testing.T) {
 	opts, db := setup(t)
-	path := filepath.Join(opts.SessionsDir, "one.jsonl")
+	path := filepath.Join(opts.SessionsDirs[0], "one.jsonl")
 	replacement := `{"type":"session","version":3,"id":"replacement","timestamp":"2026-08-27T02:00:00Z","cwd":"/scrubbed"}` + "\n" +
 		`{"type":"message","id":"only","parentId":null,"timestamp":"2026-08-27T02:00:01Z","message":{"role":"user","content":"replacement"}}` + "\n"
 	tmp := path + ".new"
@@ -247,7 +247,7 @@ func TestReplacementReimportsFile(t *testing.T) {
 
 func TestDeletedSourceIsRemovedFromDerivedIndex(t *testing.T) {
 	opts, db := setup(t)
-	if err := os.Remove(filepath.Join(opts.SessionsDir, "one.jsonl")); err != nil {
+	if err := os.Remove(filepath.Join(opts.SessionsDirs[0], "one.jsonl")); err != nil {
 		t.Fatal(err)
 	}
 	if err := Import(opts); err != nil {
@@ -267,7 +267,7 @@ func TestCrashCheckpointResumes(t *testing.T) {
 	handoffs := filepath.Join(root, "handoffs")
 	copyTree(t, "testdata/sessions", sessions)
 	copyTree(t, "testdata/handoffs", handoffs)
-	opts := ImportOptions{SessionsDir: sessions, HandoffsDir: handoffs, DBPath: filepath.Join(root, "db"), StopAfter: 3}
+	opts := ImportOptions{SessionsDirs: []string{sessions}, HandoffsDir: handoffs, DBPath: filepath.Join(root, "db"), StopAfter: 3}
 	if err := Import(opts); !errors.Is(err, ErrStopped) {
 		t.Fatalf("got %v", err)
 	}
@@ -289,7 +289,7 @@ func TestCrashCheckpointResumes(t *testing.T) {
 
 func TestCompleteMalformedLineIsReported(t *testing.T) {
 	opts, db := setup(t)
-	path := filepath.Join(opts.SessionsDir, "two.jsonl")
+	path := filepath.Join(opts.SessionsDirs[0], "two.jsonl")
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)

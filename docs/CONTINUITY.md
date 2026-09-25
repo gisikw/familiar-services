@@ -7,13 +7,14 @@ file and running the importer again is always safe. M0 has no daemon or API.
 ## Importing
 
 ```console
-familiar-services continuity import --sessions DIR --handoffs DIR --db FILE
+familiar-services continuity import --sessions DIR [--sessions DIR ...] --handoffs DIR --db FILE
 familiar-services continuity stats --db FILE
 ```
 
-The importer recursively finds `.jsonl` files. `import_state` records each
-absolute source path's inode, observed size and mtime, last committed byte
-offset, and last entry ID. Every complete JSONL line and its checkpoint are
+The importer recursively finds `.jsonl` files under every `--sessions` root;
+the option may be repeated (for example, for primary and fork session trees).
+`import_state` records each absolute source path's inode, observed size and mtime,
+last committed byte offset, and last entry ID. Every complete JSONL line and its checkpoint are
 committed atomically. A final unterminated line is treated as an in-progress Pi
 append and retried later. A changed inode or a file shorter than its checkpoint
 causes that file's session to be deleted and imported again. Sessions whose

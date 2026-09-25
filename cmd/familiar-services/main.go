@@ -84,7 +84,11 @@ func run(args []string) error {
 	switch args[1] {
 	case "import":
 		fs := flag.NewFlagSet("continuity import", flag.ContinueOnError)
-		sessions := fs.String("sessions", "", "Pi sessions directory")
+		var sessions []string
+		fs.Func("sessions", "Pi sessions directory (repeatable)", func(path string) error {
+			sessions = append(sessions, path)
+			return nil
+		})
 		handoffs := fs.String("handoffs", "", "handoff Markdown directory")
 		dbPath := fs.String("db", "", "SQLite index path")
 		if err := fs.Parse(args[2:]); err != nil {
@@ -93,7 +97,7 @@ func run(args []string) error {
 		if fs.NArg() != 0 {
 			return errors.New("unexpected positional arguments")
 		}
-		return continuity.Import(continuity.ImportOptions{SessionsDir: *sessions, HandoffsDir: *handoffs, DBPath: *dbPath})
+		return continuity.Import(continuity.ImportOptions{SessionsDirs: sessions, HandoffsDir: *handoffs, DBPath: *dbPath})
 	case "stats":
 		fs := flag.NewFlagSet("continuity stats", flag.ContinueOnError)
 		dbPath := fs.String("db", "", "SQLite index path")

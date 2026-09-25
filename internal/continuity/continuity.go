@@ -31,10 +31,10 @@ var ErrStopped = errors.New("import stopped")
 
 // ImportOptions describes one catch-up pass. StopAfter is a test hook; zero disables it.
 type ImportOptions struct {
-	SessionsDir string
-	HandoffsDir string
-	DBPath      string
-	StopAfter   int
+	SessionsDirs []string
+	HandoffsDir  string
+	DBPath       string
+	StopAfter    int
 }
 
 type header struct {
@@ -91,7 +91,7 @@ func Open(path string) (*sql.DB, error) {
 
 // Import catches the derived index up with all complete JSONL records.
 func Import(opts ImportOptions) error {
-	if opts.SessionsDir == "" || opts.HandoffsDir == "" || opts.DBPath == "" {
+	if len(opts.SessionsDirs) == 0 || opts.HandoffsDir == "" || opts.DBPath == "" {
 		return errors.New("sessions, handoffs, and db paths are required")
 	}
 	if err := os.MkdirAll(filepath.Dir(opts.DBPath), 0o750); err != nil {
@@ -106,18 +106,28 @@ func Import(opts ImportOptions) error {
 		return err
 	}
 
-	var paths []string
-	err = filepath.WalkDir(opts.SessionsDir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	pathSet := make(map[string]struct{})
+	for _, root := range opts.SessionsDirs {
+		root, err = filepath.Abs(root)
+		if err != nil {
+			return fmt.Errorf("resolve sessions root: %w", err)
 		}
-		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".jsonl") {
-			paths = append(paths, path)
+		err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".jsonl") {
+				pathSet[path] = struct{}{}
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("scan sessions %s: %w", root, err)
 		}
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("scan sessions: %w", err)
+	}
+	paths := make([]string, 0, len(pathSet))
+	for path := range pathSet {
+		paths = append(paths, path)
 	}
 	sort.Strings(paths)
 	if err := pruneMissing(db, paths); err != nil {
