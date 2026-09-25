@@ -23,8 +23,10 @@ causes that file's session to be deleted and imported again. Sessions whose
 source files disappeared are removed from the index. Re-running without changes
 is a no-op.
 
-`schema_version` is deliberately simple. A version mismatch drops the derived
-schema and rebuilds it. Complete malformed lines are checkpointed in
+`schema_version` is deliberately simple. Known versions are migrated in place;
+version 2 is upgraded to version 3 by adding the `parts.from_turn` foreign-key
+index and branch-reconciliation worklist. Unknown version mismatches drop the
+derived schema and rebuild it. Complete malformed lines are checkpointed in
 `import_errors`; `stats` reports their count and the last successful import pass.
 
 ## Source identity and faithful storage
@@ -66,7 +68,10 @@ parent has not arrived, the fork is deferred and retried on a later pass rather
 than guessing. A parent `familiar.merge.v1` custom message links to the recorded
 fork leaf with a `merge` edge and sets `parts.from_turn`. For historical compatibility only, a `familiar.branch-close.v1` marker projects `kind='branch_close'`; current writers never emit one. References
 whose session/turn has not arrived remain unresolved and are retried on every
-import pass; the importer never substitutes a timestamp or nearest leaf.
+import pass; the importer never substitutes a timestamp or nearest leaf. Fork
+prefixes are removed with one range delete. Cross-file reconciliation uses a
+persistent worklist populated while importing lifecycle records, so an unchanged
+pass does not scan every session or decode every turn's metadata.
 
 ### System prompts
 

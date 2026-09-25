@@ -1,8 +1,10 @@
 package continuity
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -48,6 +50,116 @@ func TestHeaderOnlyForkDropsCopiedPrefix(t *testing.T) {
 	if got := count(t, db, `SELECT count(*) FROM edges WHERE child_id='pi:fork:own00001' AND parent_id='pi:parent:branch01' AND edge_type='fork'`); got != 1 {
 		t.Fatalf("fork edges=%d", got)
 	}
+}
+
+// benchmarkForkDB builds the cardinality that exposed the original quadratic
+// foreign-key work: 40,000 source turns plus a fork containing those 40,000
+// copied turns and its own marker. Setup is excluded from benchmark timing.
+func benchmarkForkDB(b *testing.B) ImportOptions {
+	b.Helper()
+	root := b.TempDir()
+	sessions, handoffs := filepath.Join(root, "sessions"), filepath.Join(root, "handoffs")
+	if err := os.MkdirAll(sessions, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.MkdirAll(handoffs, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	parentPath, forkPath := filepath.Join(sessions, "parent.jsonl"), filepath.Join(sessions, "fork.jsonl")
+	var parent strings.Builder
+	parent.WriteString(`{"type":"session","id":"parent","timestamp":"2026-01-01T00:00:00Z"}` + "\n")
+	for i := 0; i < 40000; i++ {
+		fmt.Fprintf(&parent, `{"type":"message","id":"e%07d","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"x"}}`+"\n", i)
+	}
+	if err := os.WriteFile(parentPath, []byte(parent.String()), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	forkHeader := fmt.Sprintf(`{"type":"session","id":"fork","timestamp":"2026-01-01T00:00:02Z","parentSession":%q}`+"\n", parentPath)
+	if err := os.WriteFile(forkPath, []byte(forkHeader), 0o644); err != nil {
+		b.Fatal(err)
+	}
+
+	dbPath := filepath.Join(root, "continuity.db")
+	db, err := Open(dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	if err = ensureSchema(db); err != nil {
+		b.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		b.Fatal(err)
+	}
+	parentMeta := `{"type":"session","id":"parent","timestamp":"2026-01-01T00:00:00Z"}`
+	forkMeta := fmt.Sprintf(`{"type":"session","id":"fork","timestamp":"2026-01-01T00:00:02Z","parentSession":%q}`, parentPath)
+	if _, err = tx.Exec(`INSERT INTO sessions(id,source_format,source_path,started_at,meta_json) VALUES
+		('pi:parent','pi',?,'2026-01-01T00:00:00Z',?),('pi:fork','pi',?,'2026-01-01T00:00:02Z',?)`, parentPath, parentMeta, forkPath, forkMeta); err != nil {
+		b.Fatal(err)
+	}
+	turnStmt, _ := tx.Prepare(`INSERT INTO turns(id,session_id,seq,ts,role,meta_json) VALUES(?,?,?,'2026-01-01T00:00:01Z','user',?)`)
+	partStmt, _ := tx.Prepare(`INSERT INTO parts(turn_id,idx,source,body_json) VALUES(?,0,'user','{}')`)
+	for i := 0; i < 40000; i++ {
+		entryID := fmt.Sprintf("e%07d", i)
+		raw := fmt.Sprintf(`{"type":"message","id":%q,"parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"x"}}`, entryID)
+		for _, sid := range []string{"pi:parent", "pi:fork"} {
+			tid := sid + ":" + entryID
+			if _, err = turnStmt.Exec(tid, sid, i, raw); err != nil {
+				b.Fatal(err)
+			}
+			if _, err = partStmt.Exec(tid); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	turnStmt.Close()
+	partStmt.Close()
+	marker := `{"type":"custom","id":"marker01","parentId":"e0039999","timestamp":"2026-01-01T00:00:02Z","customType":"familiar.fork.v1","data":{"parentSessionId":"parent","branchEntryId":"e0039999"}}`
+	if _, err = tx.Exec(`INSERT INTO turns(id,session_id,seq,ts,role,meta_json) VALUES('pi:fork:marker01','pi:fork',40000,'2026-01-01T00:00:02Z','metadata',?);
+		INSERT INTO parts(turn_id,idx,source,body_json) VALUES('pi:fork:marker01',0,'pi:custom','{}');
+		INSERT INTO branch_reconcile_pending(session_id) VALUES('pi:fork')`, marker); err != nil {
+		b.Fatal(err)
+	}
+	for _, state := range []struct{ path, sid string }{{parentPath, "pi:parent"}, {forkPath, "pi:fork"}} {
+		info, e := os.Stat(state.path)
+		if e != nil {
+			b.Fatal(e)
+		}
+		if _, err = tx.Exec(`INSERT INTO import_state(path,inode,size,mtime_ns,byte_offset,session_id,imported_at) VALUES(?,?,?,?,?,?,?)`, state.path, statIdentity(info), info.Size(), info.ModTime().UnixNano(), info.Size(), state.sid, now()); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	return ImportOptions{SessionsDirs: []string{sessions}, HandoffsDir: handoffs, DBPath: dbPath}
+}
+
+func BenchmarkForkPrefixReconciliation80K(b *testing.B) {
+	b.Run("cleanup", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			opts := benchmarkForkDB(b)
+			b.StartTimer()
+			if err := Import(opts); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("idle-incremental", func(b *testing.B) {
+		b.StopTimer()
+		opts := benchmarkForkDB(b)
+		if err := Import(opts); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		for i := 0; i < b.N; i++ {
+			if err := Import(opts); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func TestBranchReconciliationAcrossSessionRoots(t *testing.T) {

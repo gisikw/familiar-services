@@ -188,6 +188,47 @@ func TestSchemaVersionMismatchRebuilds(t *testing.T) {
 	}
 }
 
+func TestSchemaV2MigrationPreservesDataAndAddsForeignKeyIndex(t *testing.T) {
+	root := t.TempDir()
+	sessions, handoffs := filepath.Join(root, "sessions"), filepath.Join(root, "handoffs")
+	if err := os.MkdirAll(sessions, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(handoffs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(root, "continuity.db")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = ensureSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO sessions(id,source_format,source_path,started_at,meta_json) VALUES('keep','pi','/keep','2026-01-01T00:00:00Z','{}'); DROP TABLE branch_reconcile_pending; DROP INDEX parts_from_turn; UPDATE schema_version SET version=2`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	if err = Import(ImportOptions{SessionsDirs: []string{sessions}, HandoffsDir: handoffs, DBPath: dbPath}); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := count(t, db, `SELECT count(*) FROM sessions WHERE id='keep'`); got != 1 {
+		t.Fatal("version-2 migration rebuilt the database")
+	}
+	if got := count(t, db, `SELECT count(*) FROM sqlite_master WHERE type='index' AND name='parts_from_turn'`); got != 1 {
+		t.Fatal("parts.from_turn index was not created")
+	}
+	if got := count(t, db, `SELECT version FROM schema_version`); got != SchemaVersion {
+		t.Fatalf("schema version=%d", got)
+	}
+}
+
 func TestTruncatedTrailingLineWaitsForCompletion(t *testing.T) {
 	root := t.TempDir()
 	sessions := filepath.Join(root, "sessions")

@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	SchemaVersion          = 2
+	SchemaVersion          = 3
 	systemPromptCustomType = "familiar.system-prompt.v1"
 )
 
@@ -161,6 +161,9 @@ func ensureSchema(db *sql.DB) error {
 	if err == nil && version == SchemaVersion {
 		return nil
 	}
+	if err == nil && version == 2 {
+		return migrateSchema2To3(db)
+	}
 	if err != nil && !strings.Contains(err.Error(), "no such table") {
 		return err
 	}
@@ -196,6 +199,43 @@ func ensureSchema(db *sql.DB) error {
 	}
 	_, err = db.Exec(`PRAGMA foreign_keys=ON`)
 	return err
+}
+
+// migrateSchema2To3 preserves an existing derived index. In particular, the
+// from_turn index must exist before deleting a large copied fork prefix: the
+// ON DELETE SET NULL foreign key otherwise scans all of parts once per turn.
+func migrateSchema2To3(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`CREATE INDEX IF NOT EXISTS parts_from_turn ON parts(from_turn)`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`CREATE TABLE IF NOT EXISTS branch_reconcile_pending (
+		session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE
+	)`); err != nil {
+		return err
+	}
+	// Version 2 ran reconciliation globally. Seed only sessions containing a
+	// cross-file lifecycle record (or a fork header) for their one final pass.
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO branch_reconcile_pending(session_id)
+		SELECT s.id FROM sessions s
+		WHERE coalesce(json_extract(s.meta_json,'$.parentSession'),'') <> ''
+		   OR EXISTS (
+			SELECT 1 FROM turns t WHERE t.session_id=s.id AND (
+				json_extract(t.meta_json,'$.customType') IN ('familiar.fork.v1','familiar.branch-close.v1')
+				OR json_extract(t.meta_json,'$.message.customType')='familiar.merge.v1'
+				OR (json_extract(t.meta_json,'$.type')='custom_message' AND json_extract(t.meta_json,'$.customType')='familiar.merge.v1')
+			)
+		)`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE schema_version SET version=?`, SchemaVersion); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func pruneMissing(db *sql.DB, paths []string) error {
@@ -401,6 +441,11 @@ func insertHeader(db *sql.DB, path string, h header, raw []byte, sid string, ino
 	if err != nil {
 		return err
 	}
+	if h.Parent != "" {
+		if _, err = tx.Exec(`INSERT OR IGNORE INTO branch_reconcile_pending(session_id) VALUES(?)`, sid); err != nil {
+			return err
+		}
+	}
 	if len(h.SystemPrompt) > 0 && string(h.SystemPrompt) != "null" {
 		tid := sid + ":system"
 		if _, err = tx.Exec(`INSERT OR IGNORE INTO turns(id,session_id,seq,ts,role,kind,meta_json) VALUES(?,?,?,?,?,'turn',?)`, tid, sid, 0, h.Timestamp, "system", meta); err != nil {
@@ -428,10 +473,14 @@ func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, lineOffset, 
 		return err
 	}
 	role, source := "metadata", "pi:"+e.Type
+	needsReconcile := e.CustomType == "familiar.fork.v1" || e.CustomType == "familiar.branch-close.v1" || e.CustomType == "familiar.merge.v1"
 	var blocks []json.RawMessage
 	if e.Type == "message" {
 		var m message
 		if json.Unmarshal(e.Message, &m) == nil {
+			if m.CustomType == "familiar.merge.v1" {
+				needsReconcile = true
+			}
 			role = m.Role
 			source = role
 			if role == "toolResult" || role == "bashExecution" {
@@ -506,6 +555,11 @@ func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, lineOffset, 
 			return err
 		}
 	}
+	if needsReconcile {
+		if _, err = tx.Exec(`INSERT OR IGNORE INTO branch_reconcile_pending(session_id) VALUES(?)`, sid); err != nil {
+			return err
+		}
+	}
 	if entryError != "" {
 		if _, err = tx.Exec(`INSERT INTO import_errors(path,byte_offset,error,occurred_at) VALUES(?,?,?,?)
 			ON CONFLICT(path,byte_offset) DO UPDATE SET error=excluded.error,occurred_at=excluded.occurred_at`, path, lineOffset, entryError, now()); err != nil {
@@ -525,7 +579,14 @@ func reconcileBranches(db *sql.DB) error {
 	if err := reconcileForkPrefixes(db); err != nil {
 		return err
 	}
-	rows, err := db.Query(`SELECT t.id,t.session_id,t.seq,t.meta_json,s.meta_json FROM turns t JOIN sessions s ON s.id=t.session_id ORDER BY t.session_id,t.seq`)
+	pending, err := pendingBranchSessions(db)
+	if err != nil || len(pending) == 0 {
+		return err
+	}
+	rows, err := db.Query(`SELECT t.id,t.session_id,t.seq,t.meta_json,s.meta_json
+		FROM turns t JOIN sessions s ON s.id=t.session_id
+		JOIN branch_reconcile_pending p ON p.session_id=s.id
+		ORDER BY t.session_id,t.seq`)
 	if err != nil {
 		return err
 	}
@@ -552,6 +613,7 @@ func reconcileBranches(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
+	unresolved := make(map[string]bool)
 	for i, x := range items {
 		ct, _ := x.entry["customType"].(string)
 		if ct == "familiar.branch-close.v1" {
@@ -583,9 +645,18 @@ func reconcileBranches(db *sql.DB) error {
 				}
 			}
 			if parent != "" && branch != "" {
-				if _, err = tx.Exec(`INSERT OR IGNORE INTO edges(child_id,parent_id,edge_type,inferred) SELECT ?,?,'fork',0 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)`, x.id, "pi:"+parent+":"+branch, "pi:"+parent+":"+branch); err != nil {
+				parentID := "pi:" + parent + ":" + branch
+				var exists int
+				if err = tx.QueryRow(`SELECT count(*) FROM turns WHERE id=?`, parentID).Scan(&exists); err != nil {
 					return err
 				}
+				if exists == 0 {
+					unresolved[x.sid] = true
+				} else if _, err = tx.Exec(`INSERT OR IGNORE INTO edges(child_id,parent_id,edge_type,inferred) VALUES(?,?,'fork',0)`, x.id, parentID); err != nil {
+					return err
+				}
+			} else {
+				unresolved[x.sid] = true
 			}
 			continue
 		}
@@ -611,15 +682,44 @@ func reconcileBranches(db *sql.DB) error {
 					if _, err = tx.Exec(`UPDATE parts SET from_turn=? WHERE turn_id=?`, from, x.id); err != nil {
 						return err
 					}
+				} else {
+					unresolved[x.sid] = true
 				}
+			} else {
+				unresolved[x.sid] = true
+			}
+		}
+	}
+	for _, sid := range pending {
+		if !unresolved[sid] {
+			if _, err = tx.Exec(`DELETE FROM branch_reconcile_pending WHERE session_id=?`, sid); err != nil {
+				return err
 			}
 		}
 	}
 	return tx.Commit()
 }
 
+func pendingBranchSessions(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(`SELECT session_id FROM branch_reconcile_pending ORDER BY session_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 type forkTurn struct {
 	id, entryID, parentID, customType string
+	seq                               int
 	data                              map[string]any
 }
 
@@ -627,7 +727,11 @@ type forkTurn struct {
 // creates a branched session. The parent must be present: otherwise the fork is
 // removed from the derived index and retried on a later pass.
 func reconcileForkPrefixes(db *sql.DB) error {
-	rows, err := db.Query(`SELECT id,source_path,meta_json FROM sessions ORDER BY id`)
+	rows, err := db.Query(`SELECT s.id,s.source_path,s.meta_json FROM sessions s
+		JOIN branch_reconcile_pending p ON p.session_id=s.id
+		WHERE coalesce(json_extract(s.meta_json,'$.parentSession'),'') <> ''
+		   OR EXISTS (SELECT 1 FROM turns t WHERE t.session_id=s.id AND json_extract(t.meta_json,'$.customType')='familiar.fork.v1')
+		ORDER BY s.id`)
 	if err != nil {
 		return err
 	}
@@ -648,7 +752,7 @@ func reconcileForkPrefixes(db *sql.DB) error {
 	for _, s := range sessions {
 		var h header
 		_ = json.Unmarshal([]byte(s.meta), &h)
-		turnRows, err := db.Query(`SELECT id,meta_json FROM turns WHERE session_id=? ORDER BY seq`, s.id)
+		turnRows, err := db.Query(`SELECT id,seq,meta_json FROM turns WHERE session_id=? ORDER BY seq`, s.id)
 		if err != nil {
 			return err
 		}
@@ -657,7 +761,7 @@ func reconcileForkPrefixes(db *sql.DB) error {
 		for turnRows.Next() {
 			var t forkTurn
 			var raw string
-			if err = turnRows.Scan(&t.id, &raw); err != nil {
+			if err = turnRows.Scan(&t.id, &t.seq, &raw); err != nil {
 				turnRows.Close()
 				return err
 			}
@@ -736,28 +840,34 @@ func reconcileForkPrefixes(db *sql.DB) error {
 		if marker >= 0 {
 			limit = marker
 		}
-		var inherited []string
 		firstOwn := marker
+		cutoff := -1
+		if marker >= 0 {
+			cutoff = turns[marker].seq
+		}
 		for i := 0; i < limit; i++ {
 			if turns[i].entryID == "" { // Header system-prompt pseudo-turn.
 				continue
 			}
 			if parentIDs[turns[i].entryID] {
-				inherited = append(inherited, turns[i].id)
 				continue
 			}
 			if marker < 0 { // Without a marker, only the shared leading path is inherited.
 				firstOwn = i
+				cutoff = turns[i].seq
 				break
 			}
+		}
+		if marker < 0 && firstOwn < 0 && len(turns) > 0 {
+			cutoff = turns[len(turns)-1].seq + 1
 		}
 
 		tx, err := db.Begin()
 		if err != nil {
 			return err
 		}
-		for _, id := range inherited {
-			if _, err = tx.Exec(`DELETE FROM turns WHERE id=?`, id); err != nil {
+		if cutoff >= 0 {
+			if _, err = tx.Exec(`DELETE FROM turns WHERE session_id=? AND seq < ?`, s.id, cutoff); err != nil {
 				tx.Rollback()
 				return err
 			}

@@ -1,10 +1,10 @@
--- Continuity derived index. SQLite. Schema version 2.
+-- Continuity derived index. SQLite. Schema version 3.
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE schema_version (
   version INTEGER NOT NULL
 );
-INSERT INTO schema_version(version) VALUES (2);
+INSERT INTO schema_version(version) VALUES (3);
 
 CREATE TABLE sessions (
   id            TEXT PRIMARY KEY, -- source-format namespaced session ID
@@ -36,6 +36,7 @@ CREATE TABLE parts (
   body_json   TEXT NOT NULL,      -- raw source content block, byte-for-byte
   PRIMARY KEY (turn_id, idx)
 );
+CREATE INDEX parts_from_turn ON parts(from_turn);
 
 CREATE TABLE edges (
   child_id    TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
@@ -68,6 +69,12 @@ CREATE TABLE import_errors (
 CREATE TABLE import_runs (
   singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
   last_import_at  TEXT NOT NULL
+);
+
+-- Sessions needing cross-file projection. Resolved sessions are removed, making
+-- an unchanged import independent of the total number of turns.
+CREATE TABLE branch_reconcile_pending (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE
 );
 
 -- Leaves in Pi's persisted entry tree. Metadata entries remain visible because
