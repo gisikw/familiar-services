@@ -151,6 +151,10 @@ type Service struct {
 	StartGrace time.Duration // how long a new agent has to begin working
 	Poll       time.Duration // bound on each wait for work to resume
 	Backoff    time.Duration // first retry delay after a transport failure
+
+	// Machines is the enrollment manifest (herdr-machines.json) and Catalog
+	// Herdr's saved-machine file; when both are set, Run keeps them in step.
+	Machines, Catalog string
 }
 
 func Open(stateDir string, herdr Herdr, enqueue func(scheduler.Enqueue) error) (*Service, error) {
@@ -190,6 +194,22 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	for _, a := range open {
 		s.watch(a, false)
+	}
+	if s.Machines != "" && s.Catalog != "" {
+		for tick := time.NewTicker(30 * time.Second); ; {
+			if changed, err := Reconcile(s.Machines, s.Catalog); err != nil {
+				log.Printf("fleet: reconciling machine profiles: %v", err)
+			} else if changed {
+				log.Printf("fleet: machine profiles updated from %s", s.Machines)
+			}
+			select {
+			case <-ctx.Done():
+				tick.Stop()
+				s.wg.Wait()
+				return nil
+			case <-tick.C:
+			}
+		}
 	}
 	<-ctx.Done()
 	s.wg.Wait()

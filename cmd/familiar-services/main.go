@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/gisikw/familiar-services/internal/api"
@@ -67,6 +68,15 @@ func run(args []string) error {
 			return err
 		}
 		defer fleetService.Close()
+		fleetService.Machines = os.Getenv("FAMILIAR_FLEET_MACHINES")
+		fleetService.Catalog = os.Getenv("FAMILIAR_FLEET_HERDR_CATALOG")
+		if fleetService.Catalog == "" {
+			state := os.Getenv("XDG_STATE_HOME")
+			if state == "" {
+				state = filepath.Join(os.Getenv("HOME"), ".local", "state")
+			}
+			fleetService.Catalog = filepath.Join(state, "herdr", "client", "endpoints.json")
+		}
 		go fleetService.Run(ctx)
 		return api.New(*socket, api.Services{Attention: attn, Scheduler: sched, Push: pushService, Fleet: fleetService, DefaultTarget: *defaultTarget}).Serve(ctx)
 	}
