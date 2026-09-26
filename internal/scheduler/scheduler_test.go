@@ -140,3 +140,46 @@ func TestMigrateLegacyFiles(t *testing.T) {
 		t.Fatalf("rerun: %d %v", n, err)
 	}
 }
+
+func mergeBody(fork string) string {
+	return `{"summary":"home","forkSessionId":"` + fork + `","forkSessionFile":"/tmp/f.jsonl","branchEntryId":"b","firstEntryId":"f","lastEntryId":"l","mergedAt":"2026-01-01T00:00:00Z","turnCount":1,"forkedFurther":false}`
+}
+
+func TestMergedForkForwarding(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().UnixMilli()
+	// Waiting for the fork before it merges: one pending, one delivered to a Pi about to exit.
+	s.Enqueue(Enqueue{ID: "pending", Target: "instance:fork", Summary: "agent settled"})
+	s.Enqueue(Enqueue{ID: "inflight", Target: "instance:fork", Summary: "agent blocked"})
+	if got, _ := s.Claim("instance:fork", now); got == nil {
+		t.Fatal("setup claim")
+	}
+	if _, _, err := s.Enqueue(Enqueue{ID: "m1", Target: "instance:parent", Type: "merge", Summary: "home", Body: mergeBody("fork")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"pending", "inflight"} {
+		e, _ := s.Get(id)
+		if e.Target != "instance:parent" || e.State != "pending" || e.Summary[:17] != "(for merged fork " {
+			t.Fatalf("%s not forwarded: %#v", id, e)
+		}
+	}
+	// Arriving after the merge.
+	late, _, err := s.Enqueue(Enqueue{Target: "fork", Summary: "late settle"})
+	if err != nil || late.Target != "instance:parent" || late.Summary != "(for merged fork fork) late settle" {
+		t.Fatalf("late event: %#v %v", late, err)
+	}
+	// A fork of the merged fork comes home to the grandparent, and forwards through it.
+	if _, _, err := s.Enqueue(Enqueue{ID: "m2", Target: "instance:fork", Type: "merge", Summary: "home", Body: mergeBody("grandchild")}); err != nil {
+		t.Fatal(err)
+	}
+	if m2, _ := s.Get("m2"); m2.Target != "instance:parent" {
+		t.Fatalf("grandchild merge not forwarded: %s", m2.Target)
+	}
+	if r, _ := s.Resolve("instance:grandchild"); r != "instance:parent" {
+		t.Fatalf("resolve grandchild: %s", r)
+	}
+	// Live instances resolve to themselves.
+	if r, _ := s.Resolve("instance:someone"); r != "instance:someone" {
+		t.Fatalf("resolve live: %s", r)
+	}
+}

@@ -85,6 +85,10 @@ func Open(stateDir string) (*Store, error) {
 			state TEXT NOT NULL CHECK(state IN ('pending','delivered','acked')), created_at INTEGER NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS events_delivery ON events(target,state,due_at,priority,created_at)`,
 		`CREATE TABLE IF NOT EXISTS dnd (target TEXT PRIMARY KEY, set_by TEXT NOT NULL, set_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
+		// A merged fork's address forwards to what it merged into, so late
+		// deliveries (an agent it dispatched settling, a wake it scheduled) reach
+		// someone who can act on them.
+		`CREATE TABLE IF NOT EXISTS merged (fork TEXT PRIMARY KEY, parent TEXT NOT NULL, merged_at INTEGER NOT NULL)`,
 	} {
 		if _, err = db.Exec(q); err != nil {
 			db.Close()
@@ -151,6 +155,24 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 		if json.Unmarshal([]byte(in.Body), &m) != nil || strings.TrimSpace(m.Summary) == "" || m.ForkSessionID == "" || m.ForkSessionFile == "" || m.BranchEntryID == "" || m.FirstEntryID == "" || m.LastEntryID == "" || m.MergedAt == "" || m.TurnCount == nil || *m.TurnCount < 0 || m.ForkedFurther == nil {
 			return Event{}, false, errors.New("merge requires summary, forkSessionId/file, branch/first/last entry ids, mergedAt, turnCount, and forkedFurther")
 		}
+		if resolved, err := s.Resolve(in.Target); err != nil {
+			return Event{}, false, err
+		} else {
+			// A fork whose parent already came home returns to the grandparent.
+			in.Target = resolved
+		}
+		if err := s.recordMerge("instance:"+m.ForkSessionID, in.Target); err != nil {
+			return Event{}, false, err
+		}
+	} else {
+		resolved, err := s.Resolve(in.Target)
+		if err != nil {
+			return Event{}, false, err
+		}
+		if resolved != in.Target {
+			in.Summary = "(for merged fork " + shortID(in.Target) + ") " + in.Summary
+			in.Target = resolved
+		}
 	}
 	if in.Type == "fork" && !strings.HasPrefix(in.Target, "instance:") {
 		return Event{}, false, errors.New("a fork event targets the instance to fork from (instance:<session id>)")
@@ -211,6 +233,59 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 }
 
 const eventColumns = `id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at,rule,series`
+
+func shortID(target string) string {
+	id := strings.TrimPrefix(target, "instance:")
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// Resolve follows merged-fork forwarding: an event for a fork that has come
+// home is delivered to the instance it merged into (transitively, for a fork
+// of a fork). Non-instance targets and live instances resolve to themselves.
+func (s *Store) Resolve(target string) (string, error) {
+	target = NormalizeTarget(target)
+	for hops := 0; hops < 8 && strings.HasPrefix(target, "instance:"); hops++ {
+		var parent string
+		err := s.db.QueryRow(`SELECT parent FROM merged WHERE fork=?`, target).Scan(&parent)
+		if errors.Is(err, sql.ErrNoRows) {
+			return target, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		target = parent
+	}
+	return target, nil
+}
+
+// recordMerge remembers where a fork went and forwards anything still waiting
+// for it (pending, or delivered to a Pi that is shutting down) to its parent.
+// The fork's own merge event is enqueued to the parent, so it is unaffected.
+func (s *Store) recordMerge(fork, parent string) error {
+	if fork == parent || !strings.HasPrefix(parent, "instance:") {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`INSERT INTO merged(fork,parent,merged_at) VALUES(?,?,?) ON CONFLICT(fork) DO UPDATE SET parent=excluded.parent,merged_at=excluded.merged_at`, fork, parent, s.now().UnixMilli()); err != nil {
+		return err
+	}
+	prefix := "(for merged fork " + shortID(fork) + ") "
+	if _, err = tx.Exec(`UPDATE events SET target=?, state='pending', summary=?||summary WHERE target=? AND state IN ('pending','delivered') AND type!='fork'`, parent, prefix, fork); err != nil {
+		return err
+	}
+	// A scheduled fork set by the fork keeps its schedule: spawn it from the parent.
+	if _, err = tx.Exec(`UPDATE events SET target=? WHERE target=? AND state='pending' AND type='fork'`, parent, fork); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 type execer interface {
 	Exec(string, ...any) (sql.Result, error)
