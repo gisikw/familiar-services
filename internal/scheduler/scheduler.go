@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,6 +34,8 @@ type Event struct {
 	Urgency   string `json:"urgency"`
 	State     string `json:"state"`
 	CreatedAt int64  `json:"created_at"`
+	Rule      string `json:"rule,omitempty"`
+	Series    string `json:"series,omitempty"`
 }
 type Enqueue struct {
 	ID       string `json:"id"`
@@ -45,6 +48,10 @@ type Enqueue struct {
 	Summary  string `json:"summary"`
 	Body     string `json:"body"`
 	Urgency  string `json:"urgency"`
+	// Rule makes the event recurring (see ParseRule). Each delivery enqueues
+	// the next occurrence in the same transaction; the series id is the first
+	// occurrence's id, and cancelling any occurrence cancels the series.
+	Rule string `json:"rule"`
 }
 type DND struct {
 	Enabled   bool   `json:"enabled"`
@@ -85,7 +92,17 @@ func Open(stateDir string) (*Store, error) {
 		}
 	}
 	// Existing M2 databases predate urgency; SQLite has no ADD COLUMN IF NOT EXISTS.
-	if _, err = db.Exec(`ALTER TABLE events ADD COLUMN urgency TEXT NOT NULL DEFAULT 'wake' CHECK(urgency IN ('wake','soft'))`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+	for _, q := range []string{
+		`ALTER TABLE events ADD COLUMN urgency TEXT NOT NULL DEFAULT 'wake' CHECK(urgency IN ('wake','soft'))`,
+		`ALTER TABLE events ADD COLUMN rule TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE events ADD COLUMN series TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err = db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, err
+		}
+	}
+	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS events_series ON events(series) WHERE series != ''`); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -135,6 +152,16 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 			return Event{}, false, errors.New("merge requires summary, forkSessionId/file, branch/first/last entry ids, mergedAt, turnCount, and forkedFurther")
 		}
 	}
+	if in.Type == "fork" && !strings.HasPrefix(in.Target, "instance:") {
+		return Event{}, false, errors.New("a fork event targets the instance to fork from (instance:<session id>)")
+	}
+	var rule Rule
+	if in.Rule != "" {
+		var err error
+		if rule, err = ParseRule(in.Rule); err != nil {
+			return Event{}, false, err
+		}
+	}
 	priority := 2
 	if in.Priority != nil {
 		priority = *in.Priority
@@ -149,6 +176,9 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 		return Event{}, false, errors.New("urgency must be wake or soft")
 	}
 	now := s.now().UnixMilli()
+	if in.DueAt == 0 && in.Rule != "" {
+		in.DueAt = rule.First(s.now()).UnixMilli()
+	}
 	if in.DueAt == 0 {
 		in.DueAt = now
 	}
@@ -165,7 +195,10 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 		in.Body = in.Summary
 	}
 	e := Event{ID: in.ID, DueAt: in.DueAt, Target: in.Target, Origin: in.Origin, Source: in.Source, Priority: priority, Type: in.Type, Summary: in.Summary, Body: in.Body, Urgency: in.Urgency, State: "pending", CreatedAt: now}
-	res, err := s.db.Exec(`INSERT OR IGNORE INTO events(id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)`, e.ID, e.DueAt, e.Target, e.Origin, e.Source, e.Priority, e.Type, e.Summary, e.Body, e.Urgency, e.CreatedAt)
+	if in.Rule != "" {
+		e.Rule, e.Series = strings.ToLower(strings.TrimSpace(in.Rule)), in.ID
+	}
+	res, err := insertEvent(s.db, e)
 	if err != nil {
 		return Event{}, false, err
 	}
@@ -176,18 +209,31 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 	}
 	return e, true, nil
 }
+
+const eventColumns = `id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at,rule,series`
+
+type execer interface {
+	Exec(string, ...any) (sql.Result, error)
+}
+
+func insertEvent(db execer, e Event) (sql.Result, error) {
+	return db.Exec(`INSERT OR IGNORE INTO events(`+eventColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)`, e.ID, e.DueAt, e.Target, e.Origin, e.Source, e.Priority, e.Type, e.Summary, e.Body, e.Urgency, e.CreatedAt, e.Rule, e.Series)
+}
+
 func scanEvent(row interface{ Scan(...any) error }) (Event, error) {
 	var e Event
-	err := row.Scan(&e.ID, &e.DueAt, &e.Target, &e.Origin, &e.Source, &e.Priority, &e.Type, &e.Summary, &e.Body, &e.Urgency, &e.State, &e.CreatedAt)
+	err := row.Scan(&e.ID, &e.DueAt, &e.Target, &e.Origin, &e.Source, &e.Priority, &e.Type, &e.Summary, &e.Body, &e.Urgency, &e.State, &e.CreatedAt, &e.Rule, &e.Series)
 	return e, err
 }
 func (s *Store) Get(id string) (Event, error) {
-	return scanEvent(s.db.QueryRow(`SELECT id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at FROM events WHERE id=?`, id))
+	return scanEvent(s.db.QueryRow(`SELECT `+eventColumns+` FROM events WHERE id=?`, id))
 }
+
+// List returns undelivered and in-flight events. target "*" lists every target.
 func (s *Store) List(target string) ([]Event, error) {
-	q := `SELECT id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at FROM events WHERE state!='acked'`
+	q := `SELECT ` + eventColumns + ` FROM events WHERE state!='acked'`
 	args := []any{}
-	if target != "" {
+	if target != "" && target != "*" {
 		q += ` AND target=?`
 		args = append(args, NormalizeTarget(target))
 	}
@@ -207,8 +253,16 @@ func (s *Store) List(target string) ([]Event, error) {
 	}
 	return out, rows.Err()
 }
+
+// Cancel stops an event; for a recurring event it stops the whole series
+// (any occurrence id, or the series id itself, works).
 func (s *Store) Cancel(id string) (bool, error) {
-	r, err := s.db.Exec(`UPDATE events SET state='acked' WHERE id=? AND state!='acked'`, id)
+	var series string
+	_ = s.db.QueryRow(`SELECT series FROM events WHERE id=?`, id).Scan(&series)
+	if series == "" {
+		series = id
+	}
+	r, err := s.db.Exec(`UPDATE events SET state='acked' WHERE (id=? OR series=?) AND state!='acked'`, id, series)
 	if err != nil {
 		return false, err
 	}
@@ -241,9 +295,12 @@ func (s *Store) Claim(target string, now int64) (*Event, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	query := `SELECT id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at FROM events WHERE target=? AND state='pending' AND due_at<=?`
+	query := `SELECT ` + eventColumns + ` FROM events WHERE target=? AND state='pending' AND due_at<=?`
 	if dnd != nil {
-		query += ` AND urgency='soft'`
+		// DND holds interruptions. Soft notes ride the next user turn, and a
+		// scheduled fork runs in the background without a turn in the target,
+		// so neither interrupts; its merge is what DND governs.
+		query += ` AND (urgency='soft' OR type='fork')`
 	}
 	e, err := scanEvent(tx.QueryRow(query+` ORDER BY priority,due_at,created_at LIMIT 1`, target, now))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -254,6 +311,26 @@ func (s *Store) Claim(target string, now int64) (*Event, error) {
 	}
 	if _, err = tx.Exec(`UPDATE events SET state='delivered' WHERE id=? AND state='pending'`, e.ID); err != nil {
 		return nil, err
+	}
+	if e.Rule != "" {
+		// Enqueue the next occurrence with the delivery, so a series never has
+		// zero or two pending occurrences. After() never lands at or before
+		// now: a late delivery fires once, then resumes the cadence.
+		rule, perr := ParseRule(e.Rule)
+		if perr == nil {
+			next := e
+			next.DueAt = rule.After(time.UnixMilli(e.DueAt), time.UnixMilli(now)).UnixMilli()
+			next.ID = fmt.Sprintf("%s-at-%d", e.Series, next.DueAt)
+			next.CreatedAt = s.now().UnixMilli()
+			if len(next.ID) > 160 {
+				next.ID = mint(s.now())
+			}
+			if _, err = insertEvent(tx, next); err != nil {
+				return nil, err
+			}
+		} else {
+			log.Printf("scheduler: series %s has an unparseable rule %q; not rescheduling", e.Series, e.Rule)
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err

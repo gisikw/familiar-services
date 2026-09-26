@@ -272,6 +272,9 @@ func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 		return map[string]any{"event": e, "created": created}, err
 	case "schedule.list":
 		target, _ := r.Args["target"].(string)
+		if all, _ := r.Args["all"].(bool); all {
+			target = "*"
+		}
 		if target == "" {
 			origin, _ := r.Args["origin"].(string)
 			if origin != "" {
