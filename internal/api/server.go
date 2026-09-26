@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gisikw/familiar-services/internal/attention"
+	"github.com/gisikw/familiar-services/internal/fleet"
 	"github.com/gisikw/familiar-services/internal/push"
 	"github.com/gisikw/familiar-services/internal/scheduler"
 )
@@ -24,6 +25,7 @@ type Services struct {
 	Attention     *attention.Store
 	Scheduler     *scheduler.Store
 	Push          *push.Service
+	Fleet         *fleet.Service
 	DefaultTarget string
 }
 type request struct {
@@ -249,6 +251,16 @@ func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 			return nil, &push.CodedError{Code: "unavailable", Err: errors.New("APNs is unavailable")}
 		}
 		return s.services.Push.Handle(context.Background(), r.Op, r.Args)
+	}
+	if strings.HasPrefix(r.Op, "fleet.") {
+		if s.services.Fleet == nil {
+			return nil, errors.New("fleet is unavailable")
+		}
+		// Fleet calls run herdr over SSH; bound them so a dead node can't pin a
+		// socket connection forever.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		return s.services.Fleet.Handle(ctx, r.Op, r.Args, strings.TrimPrefix(connectedTarget, "instance:"))
 	}
 	switch r.Op {
 	case "schedule.enqueue", "notify":

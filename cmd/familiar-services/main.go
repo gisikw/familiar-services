@@ -13,6 +13,7 @@ import (
 	"github.com/gisikw/familiar-services/internal/api"
 	"github.com/gisikw/familiar-services/internal/attention"
 	"github.com/gisikw/familiar-services/internal/continuity"
+	"github.com/gisikw/familiar-services/internal/fleet"
 	"github.com/gisikw/familiar-services/internal/push"
 	"github.com/gisikw/familiar-services/internal/scheduler"
 )
@@ -60,7 +61,14 @@ func run(args []string) error {
 		defer pushService.Close()
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		return api.New(*socket, api.Services{Attention: attn, Scheduler: sched, Push: pushService, DefaultTarget: *defaultTarget}).Serve(ctx)
+		fleetService, err := fleet.Open(*stateDir, fleet.Exec{Bin: os.Getenv("FAMILIAR_FLEET_HERDR"), LocalSession: os.Getenv("FAMILIAR_FLEET_LOCAL_SESSION")},
+			func(e scheduler.Enqueue) error { _, _, err := sched.Enqueue(e); return err })
+		if err != nil {
+			return err
+		}
+		defer fleetService.Close()
+		go fleetService.Run(ctx)
+		return api.New(*socket, api.Services{Attention: attn, Scheduler: sched, Push: pushService, Fleet: fleetService, DefaultTarget: *defaultTarget}).Serve(ctx)
 	}
 	if len(args) > 0 && args[0] == "migrate" {
 		fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
