@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/gisikw/familiar-services/internal/api"
 	"github.com/gisikw/familiar-services/internal/attention"
@@ -22,7 +23,7 @@ import (
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: familiar-services serve --socket PATH --attention-db PATH --state-dir PATH [--default-target ID]")
 	fmt.Fprintln(os.Stderr, "       familiar-services migrate --state-dir PATH --default-target ID")
-	fmt.Fprintln(os.Stderr, "       familiar-services continuity <import|stats> [options]")
+	fmt.Fprintln(os.Stderr, "       familiar-services continuity <import|stats|compact-forks> [options]")
 }
 
 func main() {
@@ -122,6 +123,21 @@ func run(args []string) error {
 			return errors.New("unexpected positional arguments")
 		}
 		return continuity.Import(continuity.ImportOptions{SessionsDirs: sessions, HandoffsDir: *handoffs, DBPath: *dbPath})
+	case "compact-forks":
+		fs := flag.NewFlagSet("continuity compact-forks", flag.ContinueOnError)
+		forks := fs.String("forks", "", "fork state directory (<forks>/<id>/sessions/*.jsonl)")
+		dbPath := fs.String("db", "", "SQLite index path")
+		minAge := fs.Duration("min-age", 24*time.Hour, "only compact files unmodified for this long")
+		dryRun := fs.Bool("dry-run", false, "report without rewriting")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return errors.New("unexpected positional arguments")
+		}
+		res, err := continuity.CompactForks(continuity.CompactOptions{ForksDir: *forks, DBPath: *dbPath, MinAge: *minAge, DryRun: *dryRun})
+		fmt.Print(continuity.FormatCompactResult(res, *dryRun))
+		return err
 	case "stats":
 		fs := flag.NewFlagSet("continuity stats", flag.ContinueOnError)
 		dbPath := fs.String("db", "", "SQLite index path")

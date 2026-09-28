@@ -114,3 +114,30 @@ pass, so newly arrived older sessions can improve the match.
 This is intentionally a timestamp heuristic. Operators should validate clock
 ordering and filename conventions against the real archive before relying on
 cross-session ancestry.
+
+## Fork compaction
+
+Inherited forks start as a copy of the parent's whole path (Pi branch files),
+so every fork file carries the primary session's full history before its own
+`familiar.fork.v1` marker. Once a fork is merged, that prefix is pure
+duplication: the index never stores it, and the parent session holds it.
+
+```console
+familiar-services continuity compact-forks --forks DIR --db FILE [--min-age 24h] [--dry-run]
+```
+
+For each `<forks>/<id>/sessions/*.jsonl`, compaction rewrites the file to
+`header + final marker + own entries` only when all of these hold: the file
+is older than `--min-age`; `import_state` matches its inode, size and mtime and
+reached EOF; the index has a `merge` edge into the session; every entry after
+the marker has its parent inside the suffix; and the index's turns for the
+session are exactly the suffix's entries. Anything else is skipped with a
+reason and left untouched. The rewrite is atomic (temp, fsync, rename) and
+`import_state` is updated in the same pass, so the importer sees an unchanged
+file. The JSONL stays the source of truth: a rebuild from compacted files
+derives the same fork (the importer skips a marker's `continue` edge when its
+parent is absent; its ancestry is the cross-session `fork` edge). Import and
+compaction serialise on an exclusive `flock` of `<db>.lock`.
+
+Deleting fork files outright would *not* be safe: the importer prunes sessions
+whose source file disappeared, so the index cannot serve as their archive.

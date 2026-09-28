@@ -97,6 +97,11 @@ func Import(opts ImportOptions) error {
 	if err := os.MkdirAll(filepath.Dir(opts.DBPath), 0o750); err != nil {
 		return err
 	}
+	unlock, err := lockIndex(opts.DBPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	db, err := Open(opts.DBPath)
 	if err != nil {
 		return err
@@ -527,7 +532,18 @@ func insertEntry(db *sql.DB, path, sid string, e entry, raw []byte, lineOffset, 
 			return err
 		}
 	}
-	if e.ParentID != nil && *e.ParentID != "" {
+	skipParent := false
+	if e.ParentID != nil && *e.ParentID != "" && e.CustomType == forkMarkerCustomType {
+		// A compacted fork file starts at its marker: the copied parent path it
+		// points into lives only in the parent session. Its ancestry is the
+		// marker's cross-session fork edge, projected during reconciliation.
+		var present int
+		if err = tx.QueryRow(`SELECT count(*) FROM turns WHERE id=?`, sid+":"+*e.ParentID).Scan(&present); err != nil {
+			return err
+		}
+		skipParent = present == 0
+	}
+	if e.ParentID != nil && *e.ParentID != "" && !skipParent {
 		pid := sid + ":" + *e.ParentID
 		var existingChildren int
 		if err = tx.QueryRow(`SELECT count(*) FROM edges WHERE parent_id=? AND edge_type='continue'`, pid).Scan(&existingChildren); err != nil {
