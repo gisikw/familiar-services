@@ -435,7 +435,15 @@ func event(tx *sql.Tx, id, actor, kind, at string, data any) error {
 }
 
 // Handle applies one existing imp attn operation. Authorship is always Kes.
-func (s *Store) Handle(op string, a map[string]any) (any, error) {
+// Handle runs op as Kes, the default author for agent (imp) callers.
+func (s *Store) Handle(op string, a map[string]any) (any, error) { return s.HandleAs("kes", op, a) }
+
+// HandleAs runs op with writes (events, notes) attributed to actor: "kevin"
+// for operator surfaces like familiar-ui, "kes" for agents.
+func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
+	if !one(actor, "kevin", "kes") {
+		return nil, code("invalid_request", "invalid actor")
+	}
 	fields := map[string][]string{
 		"project.list": {"hidden"}, "project.get": {"slug"}, "project.add": {"slug", "label", "default_policy", "repo"}, "project.set": {"slug", "label", "default_policy", "repo"},
 		"card.list": {"project", "lane", "owner", "edge", "q"}, "card.get": {"id"}, "card.add": {"project", "title", "lane", "summary", "owner", "policy"}, "card.set": {"id", "title", "summary", "owner", "policy"},
@@ -534,11 +542,11 @@ func (s *Store) Handle(op string, a map[string]any) (any, error) {
 	case "project.set":
 		return s.projectSet(a)
 	case "card.add":
-		return s.cardAdd(a, false)
+		return s.cardAdd(actor, a, false)
 	case "jot.add":
-		return s.cardAdd(a, true)
+		return s.cardAdd(actor, a, true)
 	case "card.set", "card.move", "card.block", "card.unblock", "card.done", "note.add", "evidence.add", "agent.start", "agent.set", "jot.clear-done":
-		return s.mutate(op, a)
+		return s.mutate(actor, op, a)
 	default:
 		return nil, code("invalid_request", "unknown attention operation")
 	}
@@ -670,7 +678,7 @@ func (s *Store) projectSet(a map[string]any) (any, error) {
 	}
 	return s.Handle("project.get", map[string]any{"slug": slug})
 }
-func (s *Store) cardAdd(a map[string]any, jot bool) (any, error) {
+func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 	title, ok := str(a, "title")
 	if !ok || !validText(title, 200, true) {
 		return nil, code("invalid_request", "invalid title")
@@ -730,7 +738,7 @@ func (s *Store) cardAdd(a map[string]any, jot bool) (any, error) {
 			if policy != nil {
 				data["policy"] = *policy
 			}
-			e = event(tx, id, "kes", "created", at, data)
+			e = event(tx, id, actor, "created", at, data)
 		}
 		return nil, e
 	})
@@ -739,7 +747,7 @@ func (s *Store) cardAdd(a map[string]any, jot bool) (any, error) {
 	}
 	return s.full(id)
 }
-func (s *Store) mutate(op string, a map[string]any) (any, error) {
+func (s *Store) mutate(actor, op string, a map[string]any) (any, error) {
 	var id string
 	if op != "jot.clear-done" {
 		if op == "note.add" || op == "evidence.add" || op == "agent.start" || op == "agent.set" {
@@ -826,15 +834,15 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 				edited["summary"] = true
 			}
 			if len(edited) > 0 {
-				er = event(tx, id, "kes", "edited", at, edited)
+				er = event(tx, id, actor, "edited", at, edited)
 				changed = true
 			}
 			if er == nil && !sameNull(ov, oldOwner) {
-				er = event(tx, id, "kes", "assigned", at, map[string]any{"owner": ov})
+				er = event(tx, id, actor, "assigned", at, map[string]any{"owner": ov})
 				changed = true
 			}
 			if er == nil && !sameNull(pv, oldPolicy) {
-				er = event(tx, id, "kes", "policy", at, map[string]any{"policy": pv, "default": defaultPolicy})
+				er = event(tx, id, actor, "policy", at, map[string]any{"policy": pv, "default": defaultPolicy})
 				changed = true
 			}
 			if er == nil && changed {
@@ -854,7 +862,7 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 			if old != lane {
 				_, e := tx.Exec("update cards set lane=? where id=?", lane, id)
 				if e == nil {
-					e = event(tx, id, "kes", "moved", at, map[string]any{"from": old, "to": lane})
+					e = event(tx, id, actor, "moved", at, map[string]any{"from": old, "to": lane})
 				}
 				if e == nil {
 					e = touch(true)
@@ -869,7 +877,7 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 			}
 			_, e := tx.Exec("update cards set blocked=? where id=?", reason, id)
 			if e == nil {
-				e = event(tx, id, "kes", "blocked", at, map[string]any{"reason": reason})
+				e = event(tx, id, actor, "blocked", at, map[string]any{"reason": reason})
 			}
 			if e == nil {
 				e = touch(false)
@@ -883,7 +891,7 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 			}
 			_, e := tx.Exec("update cards set blocked=null where id=?", id)
 			if e == nil {
-				e = event(tx, id, "kes", "unblocked", at, nil)
+				e = event(tx, id, actor, "unblocked", at, nil)
 			}
 			if e == nil {
 				e = touch(false)
@@ -905,7 +913,7 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 			}
 			_, e := tx.Exec("update cards set done=? where id=?", done, id)
 			if e == nil {
-				e = event(tx, id, "kes", "done", at, map[string]any{"done": done})
+				e = event(tx, id, actor, "done", at, map[string]any{"done": done})
 			}
 			if e == nil {
 				e = touch(false)
@@ -917,9 +925,9 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 				return nil, code("invalid_request", "invalid note")
 			}
 			detail, _ := optstr(a, "detail")
-			_, e := tx.Exec("insert into notes(card_id,at,by,text,detail) values(?,?,'kes',?,?)", id, at, text, detail)
+			_, e := tx.Exec("insert into notes(card_id,at,by,text,detail) values(?,?,?,?,?)", id, at, actor, text, detail)
 			if e == nil {
-				e = event(tx, id, "kes", "note", at, map[string]any{"text": text})
+				e = event(tx, id, actor, "note", at, map[string]any{"text": text})
 			}
 			if e == nil {
 				e = touch(false)
@@ -942,7 +950,7 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 			}
 			_, e := tx.Exec("insert into evidence(card_id,at,kind,title,ref,meta) values(?,?,?,?,?,?)", id, at, kind, title, ref, meta)
 			if e == nil {
-				e = event(tx, id, "kes", "evidence", at, map[string]any{"kind": kind, "title": title})
+				e = event(tx, id, actor, "evidence", at, map[string]any{"kind": kind, "title": title})
 			}
 			if e == nil {
 				e = touch(false)
@@ -963,7 +971,7 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 			harness, _ := optstr(a, "harness")
 			_, e := tx.Exec("insert into agents(card_id,name,model,host,harness,state,question,started_at,ended_at) values(?,?,?,?,?,'running',null,?,null)", id, name, model, host, harness, at)
 			if e == nil {
-				e = event(tx, id, "kes", "dispatched", at, map[string]any{"name": name})
+				e = event(tx, id, actor, "dispatched", at, map[string]any{"name": name})
 			}
 			if e == nil {
 				e = touch(false)
@@ -1000,7 +1008,7 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 			}
 			_, e := tx.Exec("update agents set state=?,question=?,ended_at=? where id=?", state, q, end, aid)
 			if e == nil {
-				e = event(tx, id, "kes", "agent", at, map[string]any{"name": name, "state": state, "question": q})
+				e = event(tx, id, actor, "agent", at, map[string]any{"name": name, "state": state, "question": q})
 			}
 			if e == nil {
 				e = touch(false)
@@ -1021,7 +1029,7 @@ func (s *Store) mutate(op string, a map[string]any) (any, error) {
 			for _, x := range ids {
 				_, e = tx.Exec("update cards set lane='archived',updated_at=?,moved_at=? where id=?", at, at, x)
 				if e == nil {
-					e = event(tx, x, "kes", "moved", at, map[string]any{"to": "archived"})
+					e = event(tx, x, actor, "moved", at, map[string]any{"to": "archived"})
 				}
 				if e != nil {
 					return nil, e

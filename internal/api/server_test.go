@@ -105,3 +105,50 @@ func TestDefaultRoutesToMostRecentHello(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestAttentionActorOnTheWire(t *testing.T) {
+	socket, cancel, done := testServer(t)
+	conn, e := net.Dial("unix", socket)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(bufio.NewReader(conn))
+	call := func(req map[string]any) map[string]any {
+		t.Helper()
+		if e := enc.Encode(req); e != nil {
+			t.Fatal(e)
+		}
+		var r map[string]any
+		if e := dec.Decode(&r); e != nil {
+			t.Fatal(e)
+		}
+		return r
+	}
+	if r := call(map[string]any{"op": "attn.project.add", "args": map[string]any{"slug": "p"}}); r["ok"] != true {
+		t.Fatalf("project: %#v", r)
+	}
+	r := call(map[string]any{"op": "attn.card.add", "args": map[string]any{"project": "p", "title": "t"}})
+	id := r["result"].(map[string]any)["id"].(string)
+	if r = call(map[string]any{"op": "attn.card.move", "actor": "kevin", "args": map[string]any{"id": id, "lane": "archived"}}); r["ok"] != true {
+		t.Fatalf("move: %#v", r)
+	}
+	if r = call(map[string]any{"op": "attn.card.move", "actor": "root", "args": map[string]any{"id": id, "lane": "captured"}}); r["ok"] != false {
+		t.Fatalf("bad actor accepted: %#v", r)
+	}
+	r = call(map[string]any{"op": "attn.card.get", "args": map[string]any{"id": id}})
+	tl := r["result"].(map[string]any)["timeline"].([]any)
+	var actors []string
+	for _, x := range tl {
+		actors = append(actors, x.(map[string]any)["actor"].(string))
+	}
+	if len(actors) != 2 || actors[0] != "kes" || actors[1] != "kevin" {
+		t.Fatalf("actors %v", actors)
+	}
+	conn.Close()
+	cancel()
+	if e = <-done; e != nil {
+		t.Fatal(e)
+	}
+}

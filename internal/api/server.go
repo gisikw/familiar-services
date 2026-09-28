@@ -31,6 +31,10 @@ type Services struct {
 type request struct {
 	Op   string         `json:"op"`
 	Args map[string]any `json:"args"`
+	// Actor attributes Attention writes: "kevin" from operator surfaces
+	// (familiar-ui), omitted/"kes" from agents. The socket is the trust
+	// boundary; this is attribution, not authorization.
+	Actor string `json:"actor,omitempty"`
 }
 type response struct {
 	OK     bool       `json:"ok"`
@@ -244,7 +248,11 @@ func failure(code, msg string) response { return response{OK: false, Error: &wir
 func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 	op := strings.TrimPrefix(r.Op, "attn.")
 	if isAttention(op) {
-		return s.services.Attention.Handle(op, r.Args)
+		actor := r.Actor
+		if actor == "" {
+			actor = "kes"
+		}
+		return s.services.Attention.HandleAs(actor, op, r.Args)
 	}
 	if r.Op == "push.register" || r.Op == "push.send" {
 		if s.services.Push == nil {

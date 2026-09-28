@@ -84,3 +84,43 @@ func TestCardPrefixResolution(t *testing.T) {
 		t.Fatal("short prefix accepted")
 	}
 }
+
+func TestActorAttribution(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "a.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err = s.Handle("project.add", map[string]any{"slug": "p"}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.Handle("card.add", map[string]any{"project": "p", "title": "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := c.(map[string]any)["id"].(string)
+	if _, err = s.HandleAs("kevin", "card.move", map[string]any{"id": id, "lane": "archived"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.HandleAs("kevin", "note.add", map[string]any{"card": id, "text": "from the UI"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.HandleAs("mallory", "card.move", map[string]any{"id": id, "lane": "captured"}); err == nil {
+		t.Fatal("unknown actor accepted")
+	}
+	var createdBy, movedBy, notedBy string
+	_ = s.db.QueryRow("select actor from events where card_id=? and kind='created'", id).Scan(&createdBy)
+	_ = s.db.QueryRow("select actor from events where card_id=? and kind='moved'", id).Scan(&movedBy)
+	_ = s.db.QueryRow("select by from notes where card_id=?", id).Scan(&notedBy)
+	if createdBy != "kes" || movedBy != "kevin" || notedBy != "kevin" {
+		t.Fatalf("created=%q moved=%q noted=%q", createdBy, movedBy, notedBy)
+	}
+	full, err := s.Handle("card.get", map[string]any{"id": id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl := full.(map[string]any)["timeline"].([]any)
+	if last := tl[len(tl)-1].(map[string]any)["text"].(string); !strings.Contains(last, "Kevin") {
+		t.Fatalf("timeline text %q", last)
+	}
+}
