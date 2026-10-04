@@ -50,6 +50,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, e
 	}
+	if e = addColumn(db, "cards", "hold_until", "text"); e != nil {
+		db.Close()
+		return nil, e
+	}
 	s := &Store{db: db, now: time.Now}
 	tx, e := db.Begin()
 	if e != nil {
@@ -63,6 +67,9 @@ func Open(path string) (*Store, error) {
 	if e == nil {
 		_, e = tx.Exec("insert or ignore into projects(slug,label,default_policy,repo,created_at,hidden) values('_today','Today','ship-tell',null,?,1)", at)
 	}
+	if e == nil {
+		e = migrateSettlingOwner(tx, at)
+	}
 	if e != nil {
 		tx.Rollback()
 		db.Close()
@@ -70,6 +77,81 @@ func Open(path string) (*Store, error) {
 	}
 	e = tx.Commit()
 	return s, e
+}
+
+// addColumn adds a column to an existing table if it is missing (SQLite has no
+// ADD COLUMN IF NOT EXISTS).
+func addColumn(db *sql.DB, table, col, typ string) error {
+	rs, e := db.Query("select name from pragma_table_info(?)", table)
+	if e != nil {
+		return e
+	}
+	for rs.Next() {
+		var name string
+		if e = rs.Scan(&name); e != nil {
+			rs.Close()
+			return e
+		}
+		if name == col {
+			rs.Close()
+			return nil
+		}
+	}
+	rs.Close()
+	_, e = db.Exec("alter table " + table + " add column " + col + " " + typ)
+	return e
+}
+
+// settlingNote is the one-line reason recorded when Settling hands a card to Kevin.
+const settlingNote = "Settling is Kev's to close."
+
+// migrateSettlingOwner runs once: Settling means "Kev, this is probably done;
+// close it when you're satisfied", so every Settling card without a Kes hold
+// becomes Kevin's.
+func migrateSettlingOwner(tx *sql.Tx, at string) error {
+	var done int
+	if e := tx.QueryRow("select count(*) from meta where key='settling_owner_v1'").Scan(&done); e != nil || done > 0 {
+		return e
+	}
+	rs, e := tx.Query("select id from cards where lane='settling' and coalesce(owner,'')<>'kevin' and hold_until is null")
+	if e != nil {
+		return e
+	}
+	ids := []string{}
+	for rs.Next() {
+		var id string
+		if e = rs.Scan(&id); e != nil {
+			rs.Close()
+			return e
+		}
+		ids = append(ids, id)
+	}
+	rs.Close()
+	for _, id := range ids {
+		if e = handToKevin(tx, id, "kes", at); e != nil {
+			return e
+		}
+	}
+	if len(ids) > 0 {
+		if _, e = tx.Exec("insert into meta(key,value) values('revision',?) on conflict(key) do update set value=excluded.value", uuid()); e != nil {
+			return e
+		}
+	}
+	_, e = tx.Exec("insert into meta(key,value) values('settling_owner_v1',?)", at)
+	return e
+}
+
+// handToKevin makes a Settling card Kevin's to close: owner kevin, no hold,
+// an assigned event and a one-line note saying why.
+func handToKevin(tx *sql.Tx, id, actor, at string) error {
+	_, e := tx.Exec("update cards set owner='kevin',hold_until=null,updated_at=? where id=?", at, id)
+	if e == nil {
+		e = event(tx, id, actor, "assigned", at, map[string]any{"owner": "kevin"})
+	}
+	if e == nil {
+		_, e = tx.Exec("insert into notes(card_id,at,by,text,detail) values(?,?,?,?,null)", id, at, actor, settlingNote)
+	}
+	return e
 }
 func (s *Store) Close() error  { return s.db.Close() }
 func (s *Store) stamp() string { return s.now().UTC().Format(time.RFC3339Nano) }
@@ -145,6 +227,7 @@ func clip(v []any) any {
 type cardRow struct {
 	ID, Project, Lane, Title          string
 	Summary, Owner, Policy, Blocked   sql.NullString
+	Hold                              sql.NullString
 	Done                              int
 	Captured, Moved, Updated, Default string
 	Hidden                            int
@@ -152,11 +235,11 @@ type cardRow struct {
 
 func scanCard(sc interface{ Scan(...any) error }) (cardRow, error) {
 	var r cardRow
-	e := sc.Scan(&r.ID, &r.Project, &r.Lane, &r.Title, &r.Summary, &r.Owner, &r.Policy, &r.Blocked, &r.Done, &r.Captured, &r.Moved, &r.Updated, &r.Default, &r.Hidden)
+	e := sc.Scan(&r.ID, &r.Project, &r.Lane, &r.Title, &r.Summary, &r.Owner, &r.Policy, &r.Blocked, &r.Hold, &r.Done, &r.Captured, &r.Moved, &r.Updated, &r.Default, &r.Hidden)
 	return r, e
 }
 
-const cardCols = "c.id,c.project,c.lane,c.title,c.summary,c.owner,c.policy,c.blocked,c.done,c.captured_at,c.moved_at,c.updated_at,p.default_policy,p.hidden"
+const cardCols = "c.id,c.project,c.lane,c.title,c.summary,c.owner,c.policy,c.blocked,c.hold_until,c.done,c.captured_at,c.moved_at,c.updated_at,p.default_policy,p.hidden"
 
 func (s *Store) card(id string) (cardRow, error) {
 	return scanCard(s.db.QueryRow("select "+cardCols+" from cards c join projects p on p.slug=c.project where c.id=?", id))
@@ -204,7 +287,7 @@ func (s *Store) concise(r cardRow) (map[string]any, error) {
 		effective = r.Policy.String
 	}
 	now := s.now().UnixMilli()
-	return map[string]any{"id": r.ID, "project": r.Project, "lane": r.Lane, "title": r.Title, "owner": n(r.Owner), "policy": n(r.Policy), "effective_policy": effective, "diverges": r.Policy.Valid && r.Policy.String != r.Default, "blocked": n(r.Blocked), "edge": edge, "dispatched": r.Lane == "inflight" && running+blocked > 0, "stale": r.Project == "_today" && r.Done == 0 && now-parseMS(r.Captured) > 36*60*60*1000, "fading": r.Lane == "captured" && now-parseMS(r.Captured) > 14*24*60*60*1000, "done": r.Done != 0, "age_s": max64(0, (now-parseMS(r.Captured))/1000), "moved_s": max64(0, (now-parseMS(r.Moved))/1000), "agents": map[string]any{"running": running, "blocked": blocked}, "notes": notes, "evidence": evidence}, nil
+	return map[string]any{"id": r.ID, "project": r.Project, "lane": r.Lane, "title": r.Title, "owner": n(r.Owner), "hold_until": n(r.Hold), "policy": n(r.Policy), "effective_policy": effective, "diverges": r.Policy.Valid && r.Policy.String != r.Default, "blocked": n(r.Blocked), "edge": edge, "dispatched": r.Lane == "inflight" && running+blocked > 0, "stale": r.Project == "_today" && r.Done == 0 && now-parseMS(r.Captured) > 36*60*60*1000, "fading": r.Lane == "captured" && now-parseMS(r.Captured) > 14*24*60*60*1000, "done": r.Done != 0, "age_s": max64(0, (now-parseMS(r.Captured))/1000), "moved_s": max64(0, (now-parseMS(r.Moved))/1000), "agents": map[string]any{"running": running, "blocked": blocked}, "notes": notes, "evidence": evidence}, nil
 }
 func max64(a, b int64) int64 {
 	if a > b {
@@ -356,6 +439,11 @@ func timelineText(actor, kind string, d map[string]any, def string) string {
 			what = "card"
 		}
 		return "edited " + what + suffix
+	case "held":
+		if g("until") != "" {
+			return "Kes holds this in settling until " + g("until") + suffix
+		}
+		return "hold released" + suffix
 	case "assigned":
 		if g("owner") != "" {
 			return who(g("owner")) + " has this" + suffix
@@ -447,7 +535,7 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 	fields := map[string][]string{
 		"project.list": {"hidden"}, "project.get": {"slug"}, "project.add": {"slug", "label", "default_policy", "repo"}, "project.set": {"slug", "label", "default_policy", "repo"},
 		"card.list": {"project", "lane", "owner", "edge", "q"}, "card.get": {"id"}, "card.add": {"project", "title", "lane", "summary", "owner", "policy"}, "card.set": {"id", "title", "summary", "owner", "policy"},
-		"card.move": {"id", "lane"}, "card.block": {"id", "reason"}, "card.unblock": {"id"}, "card.done": {"id", "done"}, "note.add": {"card", "text", "detail"},
+		"card.move": {"id", "lane", "hold_until"}, "card.block": {"id", "reason"}, "card.unblock": {"id"}, "card.done": {"id", "done"}, "note.add": {"card", "text", "detail"},
 		"evidence.add": {"card", "kind", "title", "ref", "meta"}, "agent.start": {"card", "name", "model", "host", "harness"}, "agent.set": {"card", "name", "state", "question"},
 		"jot.add": {"title", "owner"}, "jot.list": {}, "jot.clear-done": {}, "status": {},
 	}
@@ -715,6 +803,12 @@ func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 		if !one(lane, "captured", "icebox", "clarified", "inflight", "review", "settling", "archived") {
 			return nil, code("invalid_request", "invalid lane")
 		}
+		if lane == "settling" {
+			if x, ok := str(a, "owner"); ok && x == "kes" {
+				return nil, code("invalid_request", "settling is Kevin's to close; add the card elsewhere and move it with --hold-until to keep it")
+			}
+			a["owner"] = "kevin"
+		}
 	}
 	id := uuid()
 	_, e := s.write(func(tx *sql.Tx, at string) (any, error) {
@@ -787,8 +881,9 @@ func (s *Store) mutate(actor, op string, a map[string]any) (any, error) {
 		switch op {
 		case "card.set":
 			var oldTitle, defaultPolicy string
-			var oldSummary, oldOwner, oldPolicy sql.NullString
-			if er := tx.QueryRow("select c.title,c.summary,c.owner,c.policy,p.default_policy from cards c join projects p on p.slug=c.project where c.id=?", id).Scan(&oldTitle, &oldSummary, &oldOwner, &oldPolicy, &defaultPolicy); er != nil {
+			var oldSummary, oldOwner, oldPolicy, oldHold sql.NullString
+			var oldLane string
+			if er := tx.QueryRow("select c.title,c.summary,c.owner,c.policy,p.default_policy,c.lane,c.hold_until from cards c join projects p on p.slug=c.project where c.id=?", id).Scan(&oldTitle, &oldSummary, &oldOwner, &oldPolicy, &defaultPolicy, &oldLane, &oldHold); er != nil {
 				return nil, er
 			}
 			title := oldTitle
@@ -813,6 +908,11 @@ func (s *Store) mutate(actor, op string, a map[string]any) (any, error) {
 					return nil, code("invalid_request", "invalid owner")
 				}
 				ov = ptrArg(x)
+				if oldLane == "settling" && !sameNull(ov, oldOwner) {
+					if x != nil && *x == "kes" && !oldHold.Valid {
+						return nil, code("invalid_request", "settling is Kevin's to close; to keep it, move it with a hold: card move ID settling --hold-until TIME")
+					}
+				}
 			}
 			if _, has := a["policy"]; has {
 				x, ok := optstr(a, "policy")
@@ -840,6 +940,12 @@ func (s *Store) mutate(actor, op string, a map[string]any) (any, error) {
 			if er == nil && !sameNull(ov, oldOwner) {
 				er = event(tx, id, actor, "assigned", at, map[string]any{"owner": ov})
 				changed = true
+				// Handing a held Settling card away ends the hold.
+				if er == nil && oldHold.Valid {
+					if _, er = tx.Exec("update cards set hold_until=null where id=?", id); er == nil {
+						er = event(tx, id, actor, "held", at, map[string]any{"until": nil})
+					}
+				}
 			}
 			if er == nil && !sameNull(pv, oldPolicy) {
 				er = event(tx, id, actor, "policy", at, map[string]any{"policy": pv, "default": defaultPolicy})
@@ -854,22 +960,85 @@ func (s *Store) mutate(actor, op string, a map[string]any) (any, error) {
 			if !ok || !one(lane, "captured", "icebox", "clarified", "inflight", "review", "settling", "archived") {
 				return nil, code("invalid_request", "invalid lane")
 			}
+			hold, ok := optstr(a, "hold_until")
+			if !ok {
+				return nil, code("invalid_request", "invalid hold_until")
+			}
+			var holdAt string
+			if hold != nil {
+				if lane != "settling" {
+					return nil, code("invalid_request", "hold_until only applies to settling")
+				}
+				if actor != "kes" {
+					return nil, code("invalid_request", "only Kes holds a settling card; settling is Kevin's to close")
+				}
+				t, er := time.Parse(time.RFC3339, *hold)
+				if er != nil {
+					return nil, code("invalid_request", "hold_until must be an RFC3339 time")
+				}
+				if !t.After(s.now()) {
+					return nil, code("invalid_request", "hold_until must be in the future")
+				}
+				holdAt = t.UTC().Format(time.RFC3339)
+			}
 			var old string
-			_ = tx.QueryRow("select lane from cards where id=?", id).Scan(&old)
+			var oldOwner, oldHold sql.NullString
+			_ = tx.QueryRow("select lane,owner,hold_until from cards where id=?", id).Scan(&old, &oldOwner, &oldHold)
 			if lane == "icebox" && old != "captured" {
 				return nil, code("invalid_request", "icebox only from captured")
 			}
+			changed := false
 			if old != lane {
 				_, e := tx.Exec("update cards set lane=? where id=?", lane, id)
 				if e == nil {
 					e = event(tx, id, actor, "moved", at, map[string]any{"from": old, "to": lane})
 				}
-				if e == nil {
-					e = touch(true)
+				if e != nil {
+					return nil, e
 				}
-				return id, e
+				changed = true
 			}
-			return id, nil
+			var e error
+			switch {
+			case lane != "settling":
+				// Leaving Settling ends any hold.
+				if oldHold.Valid {
+					_, e = tx.Exec("update cards set hold_until=null where id=?", id)
+					if e == nil {
+						e = event(tx, id, actor, "held", at, map[string]any{"until": nil})
+					}
+					changed = true
+				}
+			case holdAt != "":
+				// Kes keeps it, with a time by which she moves it along.
+				if !oldHold.Valid || oldHold.String != holdAt || !oldOwner.Valid || oldOwner.String != "kes" {
+					_, e = tx.Exec("update cards set owner='kes',hold_until=? where id=?", holdAt, id)
+					if e == nil && (!oldOwner.Valid || oldOwner.String != "kes") {
+						e = event(tx, id, actor, "assigned", at, map[string]any{"owner": "kes"})
+					}
+					if e == nil {
+						e = event(tx, id, actor, "held", at, map[string]any{"until": holdAt})
+					}
+					changed = true
+				}
+			case old != lane || oldHold.Valid || !oldOwner.Valid || oldOwner.String != "kevin":
+				// Settling without a hold is Kevin's to close.
+				if oldHold.Valid {
+					e = event(tx, id, actor, "held", at, map[string]any{"until": nil})
+				}
+				if e == nil {
+					if oldOwner.Valid && oldOwner.String == "kevin" {
+						_, e = tx.Exec("update cards set hold_until=null where id=?", id)
+					} else {
+						e = handToKevin(tx, id, actor, at)
+					}
+				}
+				changed = true
+			}
+			if e == nil && changed {
+				e = touch(old != lane)
+			}
+			return id, e
 		case "card.block":
 			reason, ok := str(a, "reason")
 			if !ok || !validText(reason, 300, true) {
