@@ -240,3 +240,228 @@ func TestSettlingIsKevinsToClose(t *testing.T) {
 		t.Fatalf("migration ran twice: %#v", c)
 	}
 }
+
+// clock is a settable test clock for the now seam.
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time { return c.t }
+
+func openTest(t *testing.T, path string, c *clock) *Store {
+	t.Helper()
+	tz, err := time.LoadLocation("America/Chicago")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := open(path, c.now, tz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func jotTitles(t *testing.T, s *Store, all bool) []string {
+	t.Helper()
+	args := map[string]any{}
+	if all {
+		args["all"] = true
+	}
+	x, err := s.Handle("jot.list", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := []string{}
+	for _, v := range x.([]any) {
+		out = append(out, v.(map[string]any)["title"].(string))
+	}
+	return out
+}
+
+func TestJotsTodayAndMaybeAcrossLocalMidnight(t *testing.T) {
+	// 23:30 Oct 11 in Chicago (CDT, UTC-5) is already Oct 12 in UTC.
+	chi, _ := time.LoadLocation("America/Chicago")
+	c := &clock{time.Date(2026, 10, 11, 23, 30, 0, 0, chi)}
+	s := openTest(t, filepath.Join(t.TempDir(), "a.sqlite"), c)
+	defer s.Close()
+	add := func(args map[string]any) map[string]any {
+		x, err := s.Handle("jot.add", args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return x.(map[string]any)
+	}
+	maybe := add(map[string]any{"title": "maybe walk"})
+	if maybe["maybe_on"] != "2026-10-11" || maybe["due"] != nil {
+		t.Fatalf("maybe uses local date: %#v", maybe)
+	}
+	add(map[string]any{"title": "due today", "due": "2026-10-11"})
+	add(map[string]any{"title": "overdue", "due": "2026-10-09"})
+	add(map[string]any{"title": "tomorrow", "due": "2026-10-12"})
+	legacy := add(map[string]any{"title": "legacy"})
+	if _, err := s.db.Exec("update cards set maybe_on=null where id=?", legacy["id"]); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []any{"2026-10-32", "10/11/2026", "today", 7} {
+		if _, err := s.Handle("jot.add", map[string]any{"title": "x", "due": bad}); err == nil {
+			t.Fatalf("accepted due %#v", bad)
+		}
+	}
+	got := strings.Join(jotTitles(t, s, false), ",")
+	if got != "overdue,due today,maybe walk,legacy" {
+		t.Fatalf("before midnight: %s", got)
+	}
+	// Cross local midnight: the maybes fade, tomorrow's task appears.
+	c.t = time.Date(2026, 10, 12, 0, 30, 0, 0, chi)
+	if got = strings.Join(jotTitles(t, s, false), ","); got != "overdue,due today,tomorrow" {
+		t.Fatalf("after midnight: %s", got)
+	}
+	if got = strings.Join(jotTitles(t, s, true), ","); got != "overdue,due today,tomorrow,maybe walk,legacy" {
+		t.Fatalf("all: %s", got)
+	}
+	// Done dated jots stay visible (sorted last) until clear-done.
+	if _, err := s.Handle("card.done", map[string]any{"id": maybe["id"]}); err != nil {
+		t.Fatal(err)
+	}
+	dueToday := jotID(t, s, "due today")
+	if _, err := s.Handle("card.done", map[string]any{"id": dueToday}); err != nil {
+		t.Fatal(err)
+	}
+	if got = strings.Join(jotTitles(t, s, false), ","); got != "overdue,tomorrow,due today" {
+		t.Fatalf("done: %s", got)
+	}
+}
+
+func jotID(t *testing.T, s *Store, title string) string {
+	t.Helper()
+	var id string
+	if err := s.db.QueryRow("select id from cards where title=?", title).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestJotPromotionViaCardSet(t *testing.T) {
+	chi, _ := time.LoadLocation("America/Chicago")
+	c := &clock{time.Date(2026, 10, 11, 9, 0, 0, 0, chi)}
+	s := openTest(t, filepath.Join(t.TempDir(), "a.sqlite"), c)
+	defer s.Close()
+	j, err := s.Handle("jot.add", map[string]any{"title": "call mom"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := j.(map[string]any)["id"].(string)
+	x, err := s.HandleAs("kevin", "card.set", map[string]any{"id": id, "due": "2026-10-13"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := x.(map[string]any)
+	if m["due"] != "2026-10-13" || m["maybe_on"] != nil {
+		t.Fatalf("promoted: %#v", m)
+	}
+	tl := m["timeline"].([]any)
+	if last := tl[len(tl)-1].(map[string]any)["text"].(string); last != "edited due, maybe_on — Kevin" {
+		t.Fatalf("timeline %q", last)
+	}
+	var data string
+	_ = s.db.QueryRow("select data from events where card_id=? and kind='edited'", id).Scan(&data)
+	if data != `{"due":"2026-10-13","maybe_on":null}` {
+		t.Fatalf("edited event %s", data)
+	}
+	if got := jotTitles(t, s, false); len(got) != 0 {
+		t.Fatalf("future task visible: %v", got)
+	}
+	// Back to a maybe for today.
+	if x, err = s.Handle("card.set", map[string]any{"id": id, "due": nil, "maybe_on": "2026-10-11"}); err != nil {
+		t.Fatal(err)
+	}
+	if m = x.(map[string]any); m["due"] != nil || m["maybe_on"] != "2026-10-11" {
+		t.Fatalf("demoted: %#v", m)
+	}
+	if _, err = s.Handle("card.set", map[string]any{"id": id, "due": "tomorrow"}); err == nil {
+		t.Fatal("bad due accepted")
+	}
+	if _, err = s.Handle("project.add", map[string]any{"slug": "p"}); err != nil {
+		t.Fatal(err)
+	}
+	card, err := s.Handle("card.add", map[string]any{"project": "p", "title": "real card"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if card.(map[string]any)["due"] != nil {
+		t.Fatalf("card due: %#v", card)
+	}
+	if _, err = s.Handle("card.set", map[string]any{"id": card.(map[string]any)["id"], "due": "2026-10-11"}); err == nil {
+		t.Fatal("due on a non-jot accepted")
+	}
+}
+
+func TestJotsV2Migration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.sqlite")
+	chi, _ := time.LoadLocation("America/Chicago")
+	c := &clock{time.Date(2026, 10, 11, 21, 0, 0, 0, chi)} // 02:00 UTC Oct 12
+	s := openTest(t, path, c)
+	ids := map[string]string{}
+	for _, title := range []string{"Pump the Septic", "send Thinking Summaries", "Trash night", "read a book", "finished"} {
+		j, err := s.Handle("jot.add", map[string]any{"title": title})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[title] = j.(map[string]any)["id"].(string)
+	}
+	if _, err := s.Handle("card.done", map[string]any{"id": ids["finished"]}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a pre-v2 database.
+	if _, err := s.db.Exec("update cards set due=null,maybe_on=null; delete from meta where key='jots_v2_migrated'"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s = openTest(t, path, c)
+	read := func(title string) (due, maybe *string) {
+		if err := s.db.QueryRow("select due,maybe_on from cards where id=?", ids[title]).Scan(&due, &maybe); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	for _, title := range []string{"Pump the Septic", "send Thinking Summaries", "Trash night"} {
+		if due, maybe := read(title); due == nil || *due != "2026-10-11" || maybe != nil {
+			t.Fatalf("%s: due=%v maybe=%v", title, due, maybe)
+		}
+	}
+	if due, maybe := read("read a book"); due != nil || maybe == nil || *maybe != "2026-10-11" {
+		t.Fatalf("maybe: due=%v maybe=%v", due, maybe)
+	}
+	if due, maybe := read("finished"); due != nil || maybe != nil {
+		t.Fatalf("done jot migrated: due=%v maybe=%v", due, maybe)
+	}
+	// Only once.
+	if _, err := s.db.Exec("update cards set due=null,maybe_on=null"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s = openTest(t, path, c)
+	defer s.Close()
+	if due, maybe := read("Trash night"); due != nil || maybe != nil {
+		t.Fatal("migration ran twice")
+	}
+}
+
+func TestDueColumnsAddedToLegacyTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rebuild cards without due/maybe_on, as an older store had it.
+	if _, err = s.db.Exec("alter table cards drop column due; alter table cards drop column maybe_on"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	j, err := s.Handle("jot.add", map[string]any{"title": "x", "due": "2026-01-02"})
+	if err != nil || j.(map[string]any)["due"] != "2026-01-02" {
+		t.Fatalf("%#v %v", j, err)
+	}
+}

@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
+	"os"
 	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata" // FAMILIAR_TZ must resolve in a minimal Nix closure
 )
 
 const schema = `
@@ -29,8 +31,60 @@ create table if not exists meta (key text primary key,value text not null);`
 type Store struct {
 	db  *sql.DB
 	now func() time.Time
+	tz  *time.Location // local zone for jot dates (FAMILIAR_TZ)
 	mu  sync.Mutex
 }
+
+// DefaultTZ is the local zone for jot dates when FAMILIAR_TZ is unset.
+const DefaultTZ = "America/Chicago"
+
+func localZone() (*time.Location, error) {
+	name := os.Getenv("FAMILIAR_TZ")
+	if name == "" {
+		name = DefaultTZ
+	}
+	loc, e := time.LoadLocation(name)
+	if e != nil {
+		return nil, fmt.Errorf("FAMILIAR_TZ: %w", e)
+	}
+	return loc, nil
+}
+
+// today is the local calendar date (YYYY-MM-DD) in the store's zone.
+func (s *Store) today() string { return s.now().In(s.tz).Format(dateLayout) }
+
+const dateLayout = "2006-01-02"
+
+func validDate(x string) bool {
+	t, e := time.Parse(dateLayout, x)
+	return e == nil && t.Format(dateLayout) == x
+}
+
+// visibleJots is the default jot view: dated jots due today or earlier, and
+// undated maybes for today (maybe_on today, or unset and captured today).
+// Future-dated jots and earlier days' maybes are hidden, not deleted.
+func (s *Store) visibleJots(rows []cardRow) []cardRow {
+	today := s.today()
+	out := []cardRow{}
+	for _, r := range rows {
+		switch {
+		case r.Due.Valid:
+			if r.Due.String <= today {
+				out = append(out, r)
+			}
+		case r.MaybeOn.Valid:
+			if r.MaybeOn.String == today {
+				out = append(out, r)
+			}
+		default:
+			if t, e := time.Parse(time.RFC3339Nano, r.Captured); e == nil && t.In(s.tz).Format(dateLayout) == today {
+				out = append(out, r)
+			}
+		}
+	}
+	return out
+}
+
 type CodedError struct {
 	Code string
 	Err  error
@@ -39,6 +93,15 @@ type CodedError struct {
 func (e *CodedError) Error() string { return e.Err.Error() }
 func code(c, s string) error        { return &CodedError{c, errors.New(s)} }
 func Open(path string) (*Store, error) {
+	tz, e := localZone()
+	if e != nil {
+		return nil, e
+	}
+	return open(path, time.Now, tz)
+}
+
+// open is Open with the clock and zone injected (test seam).
+func open(path string, now func() time.Time, tz *time.Location) (*Store, error) {
 	if path == "" {
 		return nil, errors.New("attention db is required")
 	}
@@ -50,11 +113,13 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, e
 	}
-	if e = addColumn(db, "cards", "hold_until", "text"); e != nil {
-		db.Close()
-		return nil, e
+	for _, col := range []string{"hold_until", "due", "maybe_on"} {
+		if e = addColumn(db, "cards", col, "text"); e != nil {
+			db.Close()
+			return nil, e
+		}
 	}
-	s := &Store{db: db, now: time.Now}
+	s := &Store{db: db, now: now, tz: tz}
 	tx, e := db.Begin()
 	if e != nil {
 		return nil, e
@@ -69,6 +134,9 @@ func Open(path string) (*Store, error) {
 	}
 	if e == nil {
 		e = migrateSettlingOwner(tx, at)
+	}
+	if e == nil {
+		e = migrateJotsV2(tx, at, s.today())
 	}
 	if e != nil {
 		tx.Rollback()
@@ -138,6 +206,29 @@ func migrateSettlingOwner(tx *sql.Tx, at string) error {
 		}
 	}
 	_, e = tx.Exec("insert into meta(key,value) values('settling_owner_v1',?)", at)
+	return e
+}
+
+// migrateJotsV2 runs once: every open jot becomes a maybe for today, except
+// the few real tasks (septic, thinking summaries, trash) which become due today.
+// Nothing visible vanishes on deploy; intentions fade tonight.
+func migrateJotsV2(tx *sql.Tx, at, today string) error {
+	var done int
+	if e := tx.QueryRow("select count(*) from meta where key='jots_v2_migrated'").Scan(&done); e != nil || done > 0 {
+		return e
+	}
+	const open = "project='_today' and done=0 and lane<>'archived'"
+	const task = "(instr(lower(title),'septic')>0 or instr(lower(title),'thinking summaries')>0 or instr(lower(title),'trash')>0)"
+	if _, e := tx.Exec("update cards set due=?,maybe_on=null where "+open+" and "+task, today); e != nil {
+		return e
+	}
+	if _, e := tx.Exec("update cards set maybe_on=?,due=null where "+open+" and not "+task, today); e != nil {
+		return e
+	}
+	_, e := tx.Exec("insert into meta(key,value) values('jots_v2_migrated',?)", at)
+	if e == nil {
+		_, e = tx.Exec("insert into meta(key,value) values('revision',?) on conflict(key) do update set value=excluded.value", uuid())
+	}
 	return e
 }
 
@@ -227,7 +318,7 @@ func clip(v []any) any {
 type cardRow struct {
 	ID, Project, Lane, Title          string
 	Summary, Owner, Policy, Blocked   sql.NullString
-	Hold                              sql.NullString
+	Hold, Due, MaybeOn                sql.NullString
 	Done                              int
 	Captured, Moved, Updated, Default string
 	Hidden                            int
@@ -235,11 +326,11 @@ type cardRow struct {
 
 func scanCard(sc interface{ Scan(...any) error }) (cardRow, error) {
 	var r cardRow
-	e := sc.Scan(&r.ID, &r.Project, &r.Lane, &r.Title, &r.Summary, &r.Owner, &r.Policy, &r.Blocked, &r.Hold, &r.Done, &r.Captured, &r.Moved, &r.Updated, &r.Default, &r.Hidden)
+	e := sc.Scan(&r.ID, &r.Project, &r.Lane, &r.Title, &r.Summary, &r.Owner, &r.Policy, &r.Blocked, &r.Hold, &r.Due, &r.MaybeOn, &r.Done, &r.Captured, &r.Moved, &r.Updated, &r.Default, &r.Hidden)
 	return r, e
 }
 
-const cardCols = "c.id,c.project,c.lane,c.title,c.summary,c.owner,c.policy,c.blocked,c.hold_until,c.done,c.captured_at,c.moved_at,c.updated_at,p.default_policy,p.hidden"
+const cardCols = "c.id,c.project,c.lane,c.title,c.summary,c.owner,c.policy,c.blocked,c.hold_until,c.due,c.maybe_on,c.done,c.captured_at,c.moved_at,c.updated_at,p.default_policy,p.hidden"
 
 func (s *Store) card(id string) (cardRow, error) {
 	return scanCard(s.db.QueryRow("select "+cardCols+" from cards c join projects p on p.slug=c.project where c.id=?", id))
@@ -287,7 +378,7 @@ func (s *Store) concise(r cardRow) (map[string]any, error) {
 		effective = r.Policy.String
 	}
 	now := s.now().UnixMilli()
-	return map[string]any{"id": r.ID, "project": r.Project, "lane": r.Lane, "title": r.Title, "owner": n(r.Owner), "hold_until": n(r.Hold), "policy": n(r.Policy), "effective_policy": effective, "diverges": r.Policy.Valid && r.Policy.String != r.Default, "blocked": n(r.Blocked), "edge": edge, "dispatched": r.Lane == "inflight" && running+blocked > 0, "stale": r.Project == "_today" && r.Done == 0 && now-parseMS(r.Captured) > 36*60*60*1000, "fading": r.Lane == "captured" && now-parseMS(r.Captured) > 14*24*60*60*1000, "done": r.Done != 0, "age_s": max64(0, (now-parseMS(r.Captured))/1000), "moved_s": max64(0, (now-parseMS(r.Moved))/1000), "agents": map[string]any{"running": running, "blocked": blocked}, "notes": notes, "evidence": evidence}, nil
+	return map[string]any{"id": r.ID, "project": r.Project, "lane": r.Lane, "title": r.Title, "owner": n(r.Owner), "hold_until": n(r.Hold), "due": n(r.Due), "maybe_on": n(r.MaybeOn), "policy": n(r.Policy), "effective_policy": effective, "diverges": r.Policy.Valid && r.Policy.String != r.Default, "blocked": n(r.Blocked), "edge": edge, "dispatched": r.Lane == "inflight" && running+blocked > 0, "stale": r.Project == "_today" && r.Done == 0 && now-parseMS(r.Captured) > 36*60*60*1000, "fading": r.Lane == "captured" && now-parseMS(r.Captured) > 14*24*60*60*1000, "done": r.Done != 0, "age_s": max64(0, (now-parseMS(r.Captured))/1000), "moved_s": max64(0, (now-parseMS(r.Moved))/1000), "agents": map[string]any{"running": running, "blocked": blocked}, "notes": notes, "evidence": evidence}, nil
 }
 func max64(a, b int64) int64 {
 	if a > b {
@@ -429,7 +520,7 @@ func timelineText(actor, kind string, d map[string]any, def string) string {
 		return "moved to " + to + suffix
 	case "edited":
 		keys := []string{}
-		for _, k := range []string{"title", "summary"} {
+		for _, k := range []string{"title", "summary", "due", "maybe_on"} {
 			if _, ok := d[k]; ok {
 				keys = append(keys, k)
 			}
@@ -534,10 +625,10 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 	}
 	fields := map[string][]string{
 		"project.list": {"hidden"}, "project.get": {"slug"}, "project.add": {"slug", "label", "default_policy", "repo"}, "project.set": {"slug", "label", "default_policy", "repo"},
-		"card.list": {"project", "lane", "owner", "edge", "q"}, "card.get": {"id"}, "card.add": {"project", "title", "lane", "summary", "owner", "policy"}, "card.set": {"id", "title", "summary", "owner", "policy"},
+		"card.list": {"project", "lane", "owner", "edge", "q"}, "card.get": {"id"}, "card.add": {"project", "title", "lane", "summary", "owner", "policy"}, "card.set": {"id", "title", "summary", "owner", "policy", "due", "maybe_on"},
 		"card.move": {"id", "lane", "hold_until"}, "card.block": {"id", "reason"}, "card.unblock": {"id"}, "card.done": {"id", "done"}, "note.add": {"card", "text", "detail"},
 		"evidence.add": {"card", "kind", "title", "ref", "meta"}, "agent.start": {"card", "name", "model", "host", "harness"}, "agent.set": {"card", "name", "state", "question"},
-		"jot.add": {"title", "owner"}, "jot.list": {}, "jot.clear-done": {}, "status": {},
+		"jot.add": {"title", "owner", "due"}, "jot.list": {"all"}, "jot.clear-done": {}, "status": {},
 	}
 	if names, ok := fields[op]; !ok || !allowed(a, names...) {
 		return nil, code("invalid_request", "invalid arguments")
@@ -617,9 +708,16 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 	case "card.list":
 		return s.cardList(a)
 	case "jot.list":
-		rows, e := s.cards("c.project='_today' and c.lane<>'archived' order by c.done asc,c.captured_at asc")
+		all, ok := boolean(a, "all", false)
+		if !ok {
+			return nil, code("invalid_request", "invalid all")
+		}
+		rows, e := s.cards("c.project='_today' and c.lane<>'archived' order by c.done asc,c.due is null,c.due asc,c.captured_at asc")
 		if e != nil {
 			return nil, e
+		}
+		if !all {
+			rows = s.visibleJots(rows)
 		}
 		x, e := s.concises(rows)
 		return clip(x), e
@@ -773,6 +871,18 @@ func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 	}
 	project := "_today"
 	lane := "captured"
+	var due, maybe any
+	if jot {
+		x, ok := optstr(a, "due")
+		if !ok || (x != nil && !validDate(*x)) {
+			return nil, code("invalid_request", "due must be YYYY-MM-DD")
+		}
+		if x != nil {
+			due = *x
+		} else {
+			maybe = s.today()
+		}
+	}
 	if owner, exists := a["owner"]; exists {
 		if x, ok := owner.(string); !ok || !one(x, "kevin", "kes") {
 			return nil, code("invalid_request", "invalid owner")
@@ -823,7 +933,7 @@ func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 			owner = &x
 		}
 		policy, _ := optstr(a, "policy")
-		_, e := tx.Exec("insert into cards(id,project,lane,title,summary,owner,policy,blocked,done,captured_at,moved_at,updated_at) values(?,?,?,?,?,?,?,null,0,?,?,?)", id, project, lane, title, summary, owner, policy, at, at, at)
+		_, e := tx.Exec("insert into cards(id,project,lane,title,summary,owner,policy,blocked,done,captured_at,moved_at,updated_at,due,maybe_on) values(?,?,?,?,?,?,?,null,0,?,?,?,?,?)", id, project, lane, title, summary, owner, policy, at, at, at, due, maybe)
 		if e == nil {
 			data := map[string]any{"lane": lane}
 			if owner != nil {
@@ -831,6 +941,9 @@ func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 			}
 			if policy != nil {
 				data["policy"] = *policy
+			}
+			if due != nil {
+				data["due"] = due
 			}
 			e = event(tx, id, actor, "created", at, data)
 		}
@@ -894,9 +1007,34 @@ func (s *Store) apply(tx *sql.Tx, at, actor, op, id string, a map[string]any) (a
 	case "card.set":
 		var oldTitle, defaultPolicy string
 		var oldSummary, oldOwner, oldPolicy, oldHold sql.NullString
-		var oldLane string
-		if er := tx.QueryRow("select c.title,c.summary,c.owner,c.policy,p.default_policy,c.lane,c.hold_until from cards c join projects p on p.slug=c.project where c.id=?", id).Scan(&oldTitle, &oldSummary, &oldOwner, &oldPolicy, &defaultPolicy, &oldLane, &oldHold); er != nil {
+		var oldLane, project string
+		var oldDue, oldMaybe sql.NullString
+		if er := tx.QueryRow("select c.title,c.summary,c.owner,c.policy,p.default_policy,c.lane,c.hold_until,c.project,c.due,c.maybe_on from cards c join projects p on p.slug=c.project where c.id=?", id).Scan(&oldTitle, &oldSummary, &oldOwner, &oldPolicy, &defaultPolicy, &oldLane, &oldHold, &project, &oldDue, &oldMaybe); er != nil {
 			return nil, er
+		}
+		dv, mv := nullArg(oldDue), nullArg(oldMaybe)
+		_, hasDue := a["due"]
+		_, hasMaybe := a["maybe_on"]
+		if (hasDue || hasMaybe) && project != "_today" {
+			return nil, code("invalid_request", "due and maybe_on apply only to jots")
+		}
+		if hasMaybe {
+			x, ok := optstr(a, "maybe_on")
+			if !ok || (x != nil && !validDate(*x)) {
+				return nil, code("invalid_request", "maybe_on must be YYYY-MM-DD or null")
+			}
+			mv = ptrArg(x)
+		}
+		if hasDue {
+			x, ok := optstr(a, "due")
+			if !ok || (x != nil && !validDate(*x)) {
+				return nil, code("invalid_request", "due must be YYYY-MM-DD or null")
+			}
+			dv = ptrArg(x)
+			if x != nil {
+				// Promotion: a dated task is no longer a maybe.
+				mv = nil
+			}
 		}
 		title := oldTitle
 		if _, has := a["title"]; has {
@@ -933,7 +1071,7 @@ func (s *Store) apply(tx *sql.Tx, at, actor, op, id string, a map[string]any) (a
 			}
 			pv = ptrArg(x)
 		}
-		_, er := tx.Exec("update cards set title=?,summary=?,owner=?,policy=? where id=?", title, sv, ov, pv, id)
+		_, er := tx.Exec("update cards set title=?,summary=?,owner=?,policy=?,due=?,maybe_on=? where id=?", title, sv, ov, pv, dv, mv, id)
 		if er != nil {
 			return nil, er
 		}
@@ -944,6 +1082,12 @@ func (s *Store) apply(tx *sql.Tx, at, actor, op, id string, a map[string]any) (a
 		}
 		if !sameNull(sv, oldSummary) {
 			edited["summary"] = true
+		}
+		if !sameNull(dv, oldDue) {
+			edited["due"] = dv
+		}
+		if !sameNull(mv, oldMaybe) {
+			edited["maybe_on"] = mv
 		}
 		if len(edited) > 0 {
 			er = event(tx, id, actor, "edited", at, edited)
