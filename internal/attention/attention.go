@@ -855,359 +855,7 @@ func (s *Store) mutate(actor, op string, a map[string]any) (any, error) {
 		}
 		id = r
 	}
-	v, e := s.write(func(tx *sql.Tx, at string) (any, error) {
-		exists := func() error {
-			var n int
-			if er := tx.QueryRow("select count(*) from cards where id=?", id).Scan(&n); er != nil || n == 0 {
-				return code("not_found", "card not found")
-			}
-			return nil
-		}
-		if op != "jot.clear-done" {
-			if er := exists(); er != nil {
-				return nil, er
-			}
-		}
-		touch := func(moved bool) error {
-			q := "update cards set updated_at=? where id=?"
-			args := []any{at, id}
-			if moved {
-				q = "update cards set updated_at=?,moved_at=? where id=?"
-				args = []any{at, at, id}
-			}
-			_, er := tx.Exec(q, args...)
-			return er
-		}
-		switch op {
-		case "card.set":
-			var oldTitle, defaultPolicy string
-			var oldSummary, oldOwner, oldPolicy, oldHold sql.NullString
-			var oldLane string
-			if er := tx.QueryRow("select c.title,c.summary,c.owner,c.policy,p.default_policy,c.lane,c.hold_until from cards c join projects p on p.slug=c.project where c.id=?", id).Scan(&oldTitle, &oldSummary, &oldOwner, &oldPolicy, &defaultPolicy, &oldLane, &oldHold); er != nil {
-				return nil, er
-			}
-			title := oldTitle
-			if _, has := a["title"]; has {
-				x, ok := str(a, "title")
-				if !ok || !validText(x, 200, true) {
-					return nil, code("invalid_request", "invalid title")
-				}
-				title = x
-			}
-			sv, ov, pv := nullArg(oldSummary), nullArg(oldOwner), nullArg(oldPolicy)
-			if _, has := a["summary"]; has {
-				x, ok := optstr(a, "summary")
-				if !ok || (x != nil && !validText(*x, 4096, false)) {
-					return nil, code("invalid_request", "invalid summary")
-				}
-				sv = ptrArg(x)
-			}
-			if _, has := a["owner"]; has {
-				x, ok := optstr(a, "owner")
-				if !ok || (x != nil && !one(*x, "kevin", "kes")) {
-					return nil, code("invalid_request", "invalid owner")
-				}
-				ov = ptrArg(x)
-				if oldLane == "settling" && !sameNull(ov, oldOwner) {
-					if x != nil && *x == "kes" && !oldHold.Valid {
-						return nil, code("invalid_request", "settling is Kevin's to close; to keep it, move it with a hold: card move ID settling --hold-until TIME")
-					}
-				}
-			}
-			if _, has := a["policy"]; has {
-				x, ok := optstr(a, "policy")
-				if !ok || (x != nil && !one(*x, "ship-quiet", "ship-tell", "pr-evidence", "talk-first")) {
-					return nil, code("invalid_request", "invalid policy")
-				}
-				pv = ptrArg(x)
-			}
-			_, er := tx.Exec("update cards set title=?,summary=?,owner=?,policy=? where id=?", title, sv, ov, pv, id)
-			if er != nil {
-				return nil, er
-			}
-			changed := false
-			edited := map[string]any{}
-			if title != oldTitle {
-				edited["title"] = true
-			}
-			if !sameNull(sv, oldSummary) {
-				edited["summary"] = true
-			}
-			if len(edited) > 0 {
-				er = event(tx, id, actor, "edited", at, edited)
-				changed = true
-			}
-			if er == nil && !sameNull(ov, oldOwner) {
-				er = event(tx, id, actor, "assigned", at, map[string]any{"owner": ov})
-				changed = true
-				// Handing a held Settling card away ends the hold.
-				if er == nil && oldHold.Valid {
-					if _, er = tx.Exec("update cards set hold_until=null where id=?", id); er == nil {
-						er = event(tx, id, actor, "held", at, map[string]any{"until": nil})
-					}
-				}
-			}
-			if er == nil && !sameNull(pv, oldPolicy) {
-				er = event(tx, id, actor, "policy", at, map[string]any{"policy": pv, "default": defaultPolicy})
-				changed = true
-			}
-			if er == nil && changed {
-				er = touch(false)
-			}
-			return id, er
-		case "card.move":
-			lane, ok := str(a, "lane")
-			if !ok || !one(lane, "captured", "icebox", "clarified", "inflight", "review", "settling", "archived") {
-				return nil, code("invalid_request", "invalid lane")
-			}
-			hold, ok := optstr(a, "hold_until")
-			if !ok {
-				return nil, code("invalid_request", "invalid hold_until")
-			}
-			var holdAt string
-			if hold != nil {
-				if lane != "settling" {
-					return nil, code("invalid_request", "hold_until only applies to settling")
-				}
-				if actor != "kes" {
-					return nil, code("invalid_request", "only Kes holds a settling card; settling is Kevin's to close")
-				}
-				t, er := time.Parse(time.RFC3339, *hold)
-				if er != nil {
-					return nil, code("invalid_request", "hold_until must be an RFC3339 time")
-				}
-				if !t.After(s.now()) {
-					return nil, code("invalid_request", "hold_until must be in the future")
-				}
-				holdAt = t.UTC().Format(time.RFC3339)
-			}
-			var old string
-			var oldOwner, oldHold sql.NullString
-			_ = tx.QueryRow("select lane,owner,hold_until from cards where id=?", id).Scan(&old, &oldOwner, &oldHold)
-			if lane == "icebox" && old != "captured" {
-				return nil, code("invalid_request", "icebox only from captured")
-			}
-			changed := false
-			if old != lane {
-				_, e := tx.Exec("update cards set lane=? where id=?", lane, id)
-				if e == nil {
-					e = event(tx, id, actor, "moved", at, map[string]any{"from": old, "to": lane})
-				}
-				if e != nil {
-					return nil, e
-				}
-				changed = true
-			}
-			var e error
-			switch {
-			case lane != "settling":
-				// Leaving Settling ends any hold.
-				if oldHold.Valid {
-					_, e = tx.Exec("update cards set hold_until=null where id=?", id)
-					if e == nil {
-						e = event(tx, id, actor, "held", at, map[string]any{"until": nil})
-					}
-					changed = true
-				}
-			case holdAt != "":
-				// Kes keeps it, with a time by which she moves it along.
-				if !oldHold.Valid || oldHold.String != holdAt || !oldOwner.Valid || oldOwner.String != "kes" {
-					_, e = tx.Exec("update cards set owner='kes',hold_until=? where id=?", holdAt, id)
-					if e == nil && (!oldOwner.Valid || oldOwner.String != "kes") {
-						e = event(tx, id, actor, "assigned", at, map[string]any{"owner": "kes"})
-					}
-					if e == nil {
-						e = event(tx, id, actor, "held", at, map[string]any{"until": holdAt})
-					}
-					changed = true
-				}
-			case old != lane || oldHold.Valid || !oldOwner.Valid || oldOwner.String != "kevin":
-				// Settling without a hold is Kevin's to close.
-				if oldHold.Valid {
-					e = event(tx, id, actor, "held", at, map[string]any{"until": nil})
-				}
-				if e == nil {
-					if oldOwner.Valid && oldOwner.String == "kevin" {
-						_, e = tx.Exec("update cards set hold_until=null where id=?", id)
-					} else {
-						e = handToKevin(tx, id, actor, at)
-					}
-				}
-				changed = true
-			}
-			if e == nil && changed {
-				e = touch(old != lane)
-			}
-			return id, e
-		case "card.block":
-			reason, ok := str(a, "reason")
-			if !ok || !validText(reason, 300, true) {
-				return nil, code("invalid_request", "invalid reason")
-			}
-			_, e := tx.Exec("update cards set blocked=? where id=?", reason, id)
-			if e == nil {
-				e = event(tx, id, actor, "blocked", at, map[string]any{"reason": reason})
-			}
-			if e == nil {
-				e = touch(false)
-			}
-			return id, e
-		case "card.unblock":
-			var blocked sql.NullString
-			_ = tx.QueryRow("select blocked from cards where id=?", id).Scan(&blocked)
-			if !blocked.Valid {
-				return id, nil
-			}
-			_, e := tx.Exec("update cards set blocked=null where id=?", id)
-			if e == nil {
-				e = event(tx, id, actor, "unblocked", at, nil)
-			}
-			if e == nil {
-				e = touch(false)
-			}
-			return id, e
-		case "card.done":
-			var project string
-			var oldDone bool
-			_ = tx.QueryRow("select project,done<>0 from cards where id=?", id).Scan(&project, &oldDone)
-			if project != "_today" {
-				return nil, code("invalid_request", "only jots can be done")
-			}
-			done, ok := boolean(a, "done", true)
-			if !ok {
-				return nil, code("invalid_request", "invalid done")
-			}
-			if oldDone == done {
-				return id, nil
-			}
-			_, e := tx.Exec("update cards set done=? where id=?", done, id)
-			if e == nil {
-				e = event(tx, id, actor, "done", at, map[string]any{"done": done})
-			}
-			if e == nil {
-				e = touch(false)
-			}
-			return id, e
-		case "note.add":
-			text, ok := str(a, "text")
-			if !ok || !validText(text, 300, true) {
-				return nil, code("invalid_request", "invalid note")
-			}
-			detail, _ := optstr(a, "detail")
-			_, e := tx.Exec("insert into notes(card_id,at,by,text,detail) values(?,?,?,?,?)", id, at, actor, text, detail)
-			if e == nil {
-				e = event(tx, id, actor, "note", at, map[string]any{"text": text})
-			}
-			if e == nil {
-				e = touch(false)
-			}
-			return id, e
-		case "evidence.add":
-			kind, ok := str(a, "kind")
-			title, tok := str(a, "title")
-			if !ok || !tok || !one(kind, "pr", "commit", "shot", "run", "link") {
-				return nil, code("invalid_request", "invalid evidence")
-			}
-			ref, _ := optstr(a, "ref")
-			var meta any
-			if x, has := a["meta"]; has {
-				b, er := json.Marshal(x)
-				if er != nil || len(b) > 2048 {
-					return nil, code("invalid_request", "invalid evidence meta")
-				}
-				meta = string(b)
-			}
-			_, e := tx.Exec("insert into evidence(card_id,at,kind,title,ref,meta) values(?,?,?,?,?,?)", id, at, kind, title, ref, meta)
-			if e == nil {
-				e = event(tx, id, actor, "evidence", at, map[string]any{"kind": kind, "title": title})
-			}
-			if e == nil {
-				e = touch(false)
-			}
-			return id, e
-		case "agent.start":
-			name, ok := str(a, "name")
-			if !ok {
-				return nil, code("invalid_request", "name required")
-			}
-			var n int
-			_ = tx.QueryRow("select count(*) from agents where card_id=? and name=? and ended_at is null", id, name).Scan(&n)
-			if n > 0 {
-				return nil, code("conflict", "agent already open")
-			}
-			model, _ := optstr(a, "model")
-			host, _ := optstr(a, "host")
-			harness, _ := optstr(a, "harness")
-			_, e := tx.Exec("insert into agents(card_id,name,model,host,harness,state,question,started_at,ended_at) values(?,?,?,?,?,'running',null,?,null)", id, name, model, host, harness, at)
-			if e == nil {
-				e = event(tx, id, actor, "dispatched", at, map[string]any{"name": name})
-			}
-			if e == nil {
-				e = touch(false)
-			}
-			return id, e
-		case "agent.set":
-			name, ok := str(a, "name")
-			state, sok := str(a, "state")
-			if !ok || !sok || !one(state, "running", "blocked", "done", "failed", "cancelled") {
-				return nil, code("invalid_request", "invalid agent state")
-			}
-			var aid int
-			var oldq, ended sql.NullString
-			if er := tx.QueryRow("select id,question,ended_at from agents where card_id=? and name=? order by (ended_at is null) desc,id desc limit 1", id, name).Scan(&aid, &oldq, &ended); errors.Is(er, sql.ErrNoRows) {
-				return nil, code("not_found", "agent not found")
-			} else if er != nil {
-				return nil, er
-			}
-			q := any(nil)
-			if state == "blocked" {
-				if x, ok := str(a, "question"); ok {
-					q = x
-				} else if oldq.Valid {
-					q = oldq.String
-				}
-			}
-			end := any(nil)
-			if one(state, "done", "failed", "cancelled") {
-				if ended.Valid {
-					end = ended.String
-				} else {
-					end = at
-				}
-			}
-			_, e := tx.Exec("update agents set state=?,question=?,ended_at=? where id=?", state, q, end, aid)
-			if e == nil {
-				e = event(tx, id, actor, "agent", at, map[string]any{"name": name, "state": state, "question": q})
-			}
-			if e == nil {
-				e = touch(false)
-			}
-			return id, e
-		case "jot.clear-done":
-			rs, e := tx.Query("select id from cards where project='_today' and done=1 and lane<>'archived'")
-			if e != nil {
-				return nil, e
-			}
-			ids := []string{}
-			for rs.Next() {
-				var x string
-				_ = rs.Scan(&x)
-				ids = append(ids, x)
-			}
-			rs.Close()
-			for _, x := range ids {
-				_, e = tx.Exec("update cards set lane='archived',updated_at=?,moved_at=? where id=?", at, at, x)
-				if e == nil {
-					e = event(tx, x, actor, "moved", at, map[string]any{"to": "archived"})
-				}
-				if e != nil {
-					return nil, e
-				}
-			}
-			return map[string]any{"archived": len(ids)}, nil
-		}
-		return nil, code("invalid_request", "unknown mutation")
-	})
+	v, e := s.write(func(tx *sql.Tx, at string) (any, error) { return s.apply(tx, at, actor, op, id, a) })
 	if e != nil {
 		return nil, e
 	}
@@ -1215,6 +863,362 @@ func (s *Store) mutate(actor, op string, a map[string]any) (any, error) {
 		return v, nil
 	}
 	return s.full(id)
+}
+
+// apply runs one card mutation inside tx with id already resolved (empty for
+// jot.clear-done): the single mutation path shared by direct ops and ask.resolve.
+func (s *Store) apply(tx *sql.Tx, at, actor, op, id string, a map[string]any) (any, error) {
+	exists := func() error {
+		var n int
+		if er := tx.QueryRow("select count(*) from cards where id=?", id).Scan(&n); er != nil || n == 0 {
+			return code("not_found", "card not found")
+		}
+		return nil
+	}
+	if op != "jot.clear-done" {
+		if er := exists(); er != nil {
+			return nil, er
+		}
+	}
+	touch := func(moved bool) error {
+		q := "update cards set updated_at=? where id=?"
+		args := []any{at, id}
+		if moved {
+			q = "update cards set updated_at=?,moved_at=? where id=?"
+			args = []any{at, at, id}
+		}
+		_, er := tx.Exec(q, args...)
+		return er
+	}
+	switch op {
+	case "card.set":
+		var oldTitle, defaultPolicy string
+		var oldSummary, oldOwner, oldPolicy, oldHold sql.NullString
+		var oldLane string
+		if er := tx.QueryRow("select c.title,c.summary,c.owner,c.policy,p.default_policy,c.lane,c.hold_until from cards c join projects p on p.slug=c.project where c.id=?", id).Scan(&oldTitle, &oldSummary, &oldOwner, &oldPolicy, &defaultPolicy, &oldLane, &oldHold); er != nil {
+			return nil, er
+		}
+		title := oldTitle
+		if _, has := a["title"]; has {
+			x, ok := str(a, "title")
+			if !ok || !validText(x, 200, true) {
+				return nil, code("invalid_request", "invalid title")
+			}
+			title = x
+		}
+		sv, ov, pv := nullArg(oldSummary), nullArg(oldOwner), nullArg(oldPolicy)
+		if _, has := a["summary"]; has {
+			x, ok := optstr(a, "summary")
+			if !ok || (x != nil && !validText(*x, 4096, false)) {
+				return nil, code("invalid_request", "invalid summary")
+			}
+			sv = ptrArg(x)
+		}
+		if _, has := a["owner"]; has {
+			x, ok := optstr(a, "owner")
+			if !ok || (x != nil && !one(*x, "kevin", "kes")) {
+				return nil, code("invalid_request", "invalid owner")
+			}
+			ov = ptrArg(x)
+			if oldLane == "settling" && !sameNull(ov, oldOwner) {
+				if x != nil && *x == "kes" && !oldHold.Valid {
+					return nil, code("invalid_request", "settling is Kevin's to close; to keep it, move it with a hold: card move ID settling --hold-until TIME")
+				}
+			}
+		}
+		if _, has := a["policy"]; has {
+			x, ok := optstr(a, "policy")
+			if !ok || (x != nil && !one(*x, "ship-quiet", "ship-tell", "pr-evidence", "talk-first")) {
+				return nil, code("invalid_request", "invalid policy")
+			}
+			pv = ptrArg(x)
+		}
+		_, er := tx.Exec("update cards set title=?,summary=?,owner=?,policy=? where id=?", title, sv, ov, pv, id)
+		if er != nil {
+			return nil, er
+		}
+		changed := false
+		edited := map[string]any{}
+		if title != oldTitle {
+			edited["title"] = true
+		}
+		if !sameNull(sv, oldSummary) {
+			edited["summary"] = true
+		}
+		if len(edited) > 0 {
+			er = event(tx, id, actor, "edited", at, edited)
+			changed = true
+		}
+		if er == nil && !sameNull(ov, oldOwner) {
+			er = event(tx, id, actor, "assigned", at, map[string]any{"owner": ov})
+			changed = true
+			// Handing a held Settling card away ends the hold.
+			if er == nil && oldHold.Valid {
+				if _, er = tx.Exec("update cards set hold_until=null where id=?", id); er == nil {
+					er = event(tx, id, actor, "held", at, map[string]any{"until": nil})
+				}
+			}
+		}
+		if er == nil && !sameNull(pv, oldPolicy) {
+			er = event(tx, id, actor, "policy", at, map[string]any{"policy": pv, "default": defaultPolicy})
+			changed = true
+		}
+		if er == nil && changed {
+			er = touch(false)
+		}
+		return id, er
+	case "card.move":
+		lane, ok := str(a, "lane")
+		if !ok || !one(lane, "captured", "icebox", "clarified", "inflight", "review", "settling", "archived") {
+			return nil, code("invalid_request", "invalid lane")
+		}
+		hold, ok := optstr(a, "hold_until")
+		if !ok {
+			return nil, code("invalid_request", "invalid hold_until")
+		}
+		var holdAt string
+		if hold != nil {
+			if lane != "settling" {
+				return nil, code("invalid_request", "hold_until only applies to settling")
+			}
+			if actor != "kes" {
+				return nil, code("invalid_request", "only Kes holds a settling card; settling is Kevin's to close")
+			}
+			t, er := time.Parse(time.RFC3339, *hold)
+			if er != nil {
+				return nil, code("invalid_request", "hold_until must be an RFC3339 time")
+			}
+			if !t.After(s.now()) {
+				return nil, code("invalid_request", "hold_until must be in the future")
+			}
+			holdAt = t.UTC().Format(time.RFC3339)
+		}
+		var old string
+		var oldOwner, oldHold sql.NullString
+		_ = tx.QueryRow("select lane,owner,hold_until from cards where id=?", id).Scan(&old, &oldOwner, &oldHold)
+		if lane == "icebox" && old != "captured" {
+			return nil, code("invalid_request", "icebox only from captured")
+		}
+		changed := false
+		if old != lane {
+			_, e := tx.Exec("update cards set lane=? where id=?", lane, id)
+			if e == nil {
+				e = event(tx, id, actor, "moved", at, map[string]any{"from": old, "to": lane})
+			}
+			if e != nil {
+				return nil, e
+			}
+			changed = true
+		}
+		var e error
+		switch {
+		case lane != "settling":
+			// Leaving Settling ends any hold.
+			if oldHold.Valid {
+				_, e = tx.Exec("update cards set hold_until=null where id=?", id)
+				if e == nil {
+					e = event(tx, id, actor, "held", at, map[string]any{"until": nil})
+				}
+				changed = true
+			}
+		case holdAt != "":
+			// Kes keeps it, with a time by which she moves it along.
+			if !oldHold.Valid || oldHold.String != holdAt || !oldOwner.Valid || oldOwner.String != "kes" {
+				_, e = tx.Exec("update cards set owner='kes',hold_until=? where id=?", holdAt, id)
+				if e == nil && (!oldOwner.Valid || oldOwner.String != "kes") {
+					e = event(tx, id, actor, "assigned", at, map[string]any{"owner": "kes"})
+				}
+				if e == nil {
+					e = event(tx, id, actor, "held", at, map[string]any{"until": holdAt})
+				}
+				changed = true
+			}
+		case old != lane || oldHold.Valid || !oldOwner.Valid || oldOwner.String != "kevin":
+			// Settling without a hold is Kevin's to close.
+			if oldHold.Valid {
+				e = event(tx, id, actor, "held", at, map[string]any{"until": nil})
+			}
+			if e == nil {
+				if oldOwner.Valid && oldOwner.String == "kevin" {
+					_, e = tx.Exec("update cards set hold_until=null where id=?", id)
+				} else {
+					e = handToKevin(tx, id, actor, at)
+				}
+			}
+			changed = true
+		}
+		if e == nil && changed {
+			e = touch(old != lane)
+		}
+		return id, e
+	case "card.block":
+		reason, ok := str(a, "reason")
+		if !ok || !validText(reason, 300, true) {
+			return nil, code("invalid_request", "invalid reason")
+		}
+		_, e := tx.Exec("update cards set blocked=? where id=?", reason, id)
+		if e == nil {
+			e = event(tx, id, actor, "blocked", at, map[string]any{"reason": reason})
+		}
+		if e == nil {
+			e = touch(false)
+		}
+		return id, e
+	case "card.unblock":
+		var blocked sql.NullString
+		_ = tx.QueryRow("select blocked from cards where id=?", id).Scan(&blocked)
+		if !blocked.Valid {
+			return id, nil
+		}
+		_, e := tx.Exec("update cards set blocked=null where id=?", id)
+		if e == nil {
+			e = event(tx, id, actor, "unblocked", at, nil)
+		}
+		if e == nil {
+			e = touch(false)
+		}
+		return id, e
+	case "card.done":
+		var project string
+		var oldDone bool
+		_ = tx.QueryRow("select project,done<>0 from cards where id=?", id).Scan(&project, &oldDone)
+		if project != "_today" {
+			return nil, code("invalid_request", "only jots can be done")
+		}
+		done, ok := boolean(a, "done", true)
+		if !ok {
+			return nil, code("invalid_request", "invalid done")
+		}
+		if oldDone == done {
+			return id, nil
+		}
+		_, e := tx.Exec("update cards set done=? where id=?", done, id)
+		if e == nil {
+			e = event(tx, id, actor, "done", at, map[string]any{"done": done})
+		}
+		if e == nil {
+			e = touch(false)
+		}
+		return id, e
+	case "note.add":
+		text, ok := str(a, "text")
+		if !ok || !validText(text, 300, true) {
+			return nil, code("invalid_request", "invalid note")
+		}
+		detail, _ := optstr(a, "detail")
+		_, e := tx.Exec("insert into notes(card_id,at,by,text,detail) values(?,?,?,?,?)", id, at, actor, text, detail)
+		if e == nil {
+			e = event(tx, id, actor, "note", at, map[string]any{"text": text})
+		}
+		if e == nil {
+			e = touch(false)
+		}
+		return id, e
+	case "evidence.add":
+		kind, ok := str(a, "kind")
+		title, tok := str(a, "title")
+		if !ok || !tok || !one(kind, "pr", "commit", "shot", "run", "link") {
+			return nil, code("invalid_request", "invalid evidence")
+		}
+		ref, _ := optstr(a, "ref")
+		var meta any
+		if x, has := a["meta"]; has {
+			b, er := json.Marshal(x)
+			if er != nil || len(b) > 2048 {
+				return nil, code("invalid_request", "invalid evidence meta")
+			}
+			meta = string(b)
+		}
+		_, e := tx.Exec("insert into evidence(card_id,at,kind,title,ref,meta) values(?,?,?,?,?,?)", id, at, kind, title, ref, meta)
+		if e == nil {
+			e = event(tx, id, actor, "evidence", at, map[string]any{"kind": kind, "title": title})
+		}
+		if e == nil {
+			e = touch(false)
+		}
+		return id, e
+	case "agent.start":
+		name, ok := str(a, "name")
+		if !ok {
+			return nil, code("invalid_request", "name required")
+		}
+		var n int
+		_ = tx.QueryRow("select count(*) from agents where card_id=? and name=? and ended_at is null", id, name).Scan(&n)
+		if n > 0 {
+			return nil, code("conflict", "agent already open")
+		}
+		model, _ := optstr(a, "model")
+		host, _ := optstr(a, "host")
+		harness, _ := optstr(a, "harness")
+		_, e := tx.Exec("insert into agents(card_id,name,model,host,harness,state,question,started_at,ended_at) values(?,?,?,?,?,'running',null,?,null)", id, name, model, host, harness, at)
+		if e == nil {
+			e = event(tx, id, actor, "dispatched", at, map[string]any{"name": name})
+		}
+		if e == nil {
+			e = touch(false)
+		}
+		return id, e
+	case "agent.set":
+		name, ok := str(a, "name")
+		state, sok := str(a, "state")
+		if !ok || !sok || !one(state, "running", "blocked", "done", "failed", "cancelled") {
+			return nil, code("invalid_request", "invalid agent state")
+		}
+		var aid int
+		var oldq, ended sql.NullString
+		if er := tx.QueryRow("select id,question,ended_at from agents where card_id=? and name=? order by (ended_at is null) desc,id desc limit 1", id, name).Scan(&aid, &oldq, &ended); errors.Is(er, sql.ErrNoRows) {
+			return nil, code("not_found", "agent not found")
+		} else if er != nil {
+			return nil, er
+		}
+		q := any(nil)
+		if state == "blocked" {
+			if x, ok := str(a, "question"); ok {
+				q = x
+			} else if oldq.Valid {
+				q = oldq.String
+			}
+		}
+		end := any(nil)
+		if one(state, "done", "failed", "cancelled") {
+			if ended.Valid {
+				end = ended.String
+			} else {
+				end = at
+			}
+		}
+		_, e := tx.Exec("update agents set state=?,question=?,ended_at=? where id=?", state, q, end, aid)
+		if e == nil {
+			e = event(tx, id, actor, "agent", at, map[string]any{"name": name, "state": state, "question": q})
+		}
+		if e == nil {
+			e = touch(false)
+		}
+		return id, e
+	case "jot.clear-done":
+		rs, e := tx.Query("select id from cards where project='_today' and done=1 and lane<>'archived'")
+		if e != nil {
+			return nil, e
+		}
+		ids := []string{}
+		for rs.Next() {
+			var x string
+			_ = rs.Scan(&x)
+			ids = append(ids, x)
+		}
+		rs.Close()
+		for _, x := range ids {
+			_, e = tx.Exec("update cards set lane='archived',updated_at=?,moved_at=? where id=?", at, at, x)
+			if e == nil {
+				e = event(tx, x, actor, "moved", at, map[string]any{"to": "archived"})
+			}
+			if e != nil {
+				return nil, e
+			}
+		}
+		return map[string]any{"archived": len(ids)}, nil
+	}
+	return nil, code("invalid_request", "unknown mutation")
 }
 func nullArg(x sql.NullString) any {
 	if x.Valid {
