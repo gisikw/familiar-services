@@ -1,6 +1,9 @@
 package attention
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -464,4 +467,288 @@ func TestDueColumnsAddedToLegacyTable(t *testing.T) {
 	if err != nil || j.(map[string]any)["due"] != "2026-01-02" {
 		t.Fatalf("%#v %v", j, err)
 	}
+}
+
+type askFixture struct {
+	t *testing.T
+	s *Store
+}
+
+func (f askFixture) do(actor, op string, args map[string]any) any {
+	f.t.Helper()
+	x, err := f.s.HandleAs(actor, op, args)
+	if err != nil {
+		f.t.Fatalf("%s %v: %v", op, args, err)
+	}
+	return x
+}
+func (f askFixture) fails(code, op string, args map[string]any) {
+	f.t.Helper()
+	_, err := f.s.Handle(op, args)
+	var ce *CodedError
+	if !errors.As(err, &ce) || ce.Code != code {
+		f.t.Fatalf("%s %v: want %s, got %v", op, args, code, err)
+	}
+}
+func (f askFixture) card(title string) string {
+	f.t.Helper()
+	return f.do("kes", "card.add", map[string]any{"project": "p", "title": title, "lane": "settling"}).(map[string]any)["id"].(string)
+}
+func (f askFixture) add(card, q string, stage bool) int64 {
+	f.t.Helper()
+	x := f.do("kes", "ask.add", map[string]any{"card": card[:8], "question": q, "stage": stage, "actions": []any{map[string]any{"key": "ok", "label": "OK"}}})
+	return x.(map[string]any)["id"].(int64)
+}
+func (f askFixture) notes(card string) []string {
+	f.t.Helper()
+	rs, err := f.s.db.Query("select by||': '||text from notes where card_id=? order by id", card)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer rs.Close()
+	out := []string{}
+	for rs.Next() {
+		var x string
+		_ = rs.Scan(&x)
+		out = append(out, x)
+	}
+	return out
+}
+func (f askFixture) list() (surfaced, staged []int64) {
+	f.t.Helper()
+	m := f.do("kevin", "ask.list", map[string]any{}).(map[string]any)
+	for _, x := range m["surfaced"].([]any) {
+		surfaced = append(surfaced, x.(map[string]any)["id"].(int64))
+	}
+	for _, x := range m["staged"].([]any) {
+		staged = append(staged, x.(map[string]any)["id"].(int64))
+	}
+	return
+}
+
+func newAskFixture(t *testing.T) askFixture {
+	s, err := Open(filepath.Join(t.TempDir(), "a.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	f := askFixture{t, s}
+	f.do("kes", "project.add", map[string]any{"slug": "p", "label": "P"})
+	return f
+}
+
+func TestAsksSurfaceCapStagingAndMore(t *testing.T) {
+	f := newAskFixture(t)
+	c := f.card("M4")
+	ids := []int64{}
+	for i := 0; i < 5; i++ {
+		ids = append(ids, f.add(c, fmt.Sprintf("q%d?", i), false))
+	}
+	staged := f.add(c, "explicitly staged?", true)
+	sur, stg := f.list()
+	if fmt.Sprint(sur) != fmt.Sprint(ids[:3]) || fmt.Sprint(stg) != fmt.Sprint(append(ids[3:], staged)) {
+		t.Fatalf("surfaced %v staged %v", sur, stg)
+	}
+	st := f.do("kevin", "status", map[string]any{}).(map[string]any)
+	if st["needs_attention"] != 3 || fmt.Sprint(st["asks"]) != "map[staged:3 surfaced:3]" {
+		t.Fatalf("status %#v", st)
+	}
+	// Surfacing past the cap is refused; nothing auto-refills.
+	f.fails("conflict", "ask.surface", map[string]any{"id": ids[3]})
+	f.do("kevin", "ask.resolve", map[string]any{"id": ids[0], "choice": "not-now"})
+	if sur, _ = f.list(); len(sur) != 2 {
+		t.Fatalf("auto-refilled: %v", sur)
+	}
+	// Kes may force one up when there's room.
+	if x := f.do("kes", "ask.surface", map[string]any{"id": staged}).(map[string]any); x["state"] != "surfaced" || x["surfaced_at"] == nil {
+		t.Fatalf("surface %#v", x)
+	}
+	f.do("kevin", "ask.resolve", map[string]any{"id": ids[1], "choice": "ok"})
+	f.do("kevin", "ask.resolve", map[string]any{"id": ids[2], "choice": "ok"})
+	more := f.do("kevin", "ask.more", map[string]any{}).(map[string]any)
+	if more["surfaced"] != int64(2) || more["staged_left"] != 0 {
+		t.Fatalf("more %#v", more)
+	}
+	if sur, stg = f.list(); fmt.Sprint(sur) != fmt.Sprint([]int64{ids[3], ids[4], staged}) || len(stg) != 0 {
+		t.Fatalf("after more: %v %v", sur, stg)
+	}
+	all := f.do("kevin", "ask.list", map[string]any{"all": true}).(map[string]any)["resolved"].([]any)
+	if len(all) != 3 || all[0].(map[string]any)["id"] != ids[2] {
+		t.Fatalf("resolved list %#v", all)
+	}
+}
+
+func TestAskResolveRunsOpsAsActor(t *testing.T) {
+	f := newAskFixture(t)
+	m4 := f.card("M4 — store")
+	sib := f.card("M4 — sibling")
+	link := "https://example.com/pr/1"
+	x := f.do("kes", "ask.add", map[string]any{
+		"card": m4, "question": "Close M4 and its sibling?", "steps": "look at the PR\n\ncheck the deploy",
+		"link": link, "link_label": "PR ↗",
+		"actions": []any{
+			map[string]any{"key": "close", "label": "Close both", "primary": true, "ops": []any{
+				map[string]any{"op": "card.move", "id": m4[:8], "lane": "archived"},
+				map[string]any{"op": "card.move", "id": sib, "lane": "archived"},
+				map[string]any{"op": "note.add", "card": sib, "text": "closed with M4"},
+			}},
+			map[string]any{"key": "keep", "label": "Keep open"},
+		},
+	}).(map[string]any)
+	id := x["id"].(int64)
+	card := x["card"].(map[string]any)
+	if x["state"] != "surfaced" || card["id"] != m4 || card["project"] != "p" || card["title"] != "M4 — store" || x["link"] != link || x["link_label"] != "PR ↗" || x["resolution"] != nil {
+		t.Fatalf("ask %#v", x)
+	}
+	b, _ := json.Marshal(x["actions"])
+	if string(b) != `[{"key":"close","label":"Close both","primary":true},{"key":"keep","label":"Keep open"}]` {
+		t.Fatalf("actions on the wire: %s", b)
+	}
+	// Ops are stored but never sent to clients.
+	all, _ := json.Marshal(f.do("kevin", "ask.list", map[string]any{"all": true}))
+	if strings.Contains(string(all), "ops") || strings.Contains(string(b), "ops") {
+		t.Fatalf("ops leaked: %s", all)
+	}
+	r := f.do("kevin", "ask.resolve", map[string]any{"id": json.Number(fmt.Sprint(id)), "choice": "close"}).(map[string]any)
+	res := r["resolved"].(map[string]any)
+	if res["state"] != "resolved" || res["resolution"] != "close" || res["resolved_at"] == nil || r["card"].(map[string]any)["lane"] != "archived" {
+		t.Fatalf("resolve %#v", r)
+	}
+	var lane, mover string
+	_ = f.s.db.QueryRow("select c.lane,e.actor from cards c join events e on e.card_id=c.id and e.kind='moved' where c.id=?", sib).Scan(&lane, &mover)
+	if lane != "archived" || mover != "kevin" {
+		t.Fatalf("sibling lane=%s moved by %s", lane, mover)
+	}
+	if got := strings.Join(f.notes(m4), " | "); got != "kes: Asked Kev: Close M4 and its sibling? | kevin: Kev chose “Close both” on: Close M4 and its sibling?" {
+		t.Fatalf("m4 notes: %s", got)
+	}
+	if got := f.notes(sib); got[len(got)-1] != "kevin: closed with M4" {
+		t.Fatalf("sibling notes %v", got)
+	}
+	f.fails("conflict", "ask.resolve", map[string]any{"id": id, "choice": "close"})
+	f.fails("not_found", "ask.resolve", map[string]any{"id": 999, "choice": "close"})
+}
+
+func TestAskResolveIsAtomic(t *testing.T) {
+	f := newAskFixture(t)
+	c := f.card("x")
+	other := f.card("y")
+	// icebox is only reachable from captured: the second op fails at resolve time.
+	id := f.do("kes", "ask.add", map[string]any{"card": c, "question": "Q?", "actions": []any{map[string]any{"key": "go", "label": "Go", "ops": []any{
+		map[string]any{"op": "card.move", "id": other, "lane": "archived"},
+		map[string]any{"op": "card.move", "id": c, "lane": "icebox"},
+	}}}}).(map[string]any)["id"].(int64)
+	f.fails("invalid_request", "ask.resolve", map[string]any{"id": id, "choice": "go"})
+	var lane, state string
+	_ = f.s.db.QueryRow("select lane from cards where id=?", other).Scan(&lane)
+	_ = f.s.db.QueryRow("select state from asks where id=?", id).Scan(&state)
+	if lane != "settling" || state != "surfaced" {
+		t.Fatalf("partial resolve: lane=%s state=%s", lane, state)
+	}
+	f.fails("invalid_request", "ask.resolve", map[string]any{"id": id, "choice": "nope"})
+}
+
+func TestAskNotNowTalkDrop(t *testing.T) {
+	f := newAskFixture(t)
+	c := f.card("c")
+	a := f.add(c, "Ship it?", false)
+	b := f.add(c, "Rename it?", false)
+	d := f.add(c, "Split it?", true)
+	if x := f.do("kevin", "ask.talk", map[string]any{"id": a}).(map[string]any); x["state"] != "surfaced" || x["resolution"] != nil {
+		t.Fatalf("talk resolved: %#v", x)
+	}
+	r := f.do("kevin", "ask.resolve", map[string]any{"id": a, "choice": "not-now"}).(map[string]any)["resolved"].(map[string]any)
+	if r["resolution"] != "not-now" || r["state"] != "resolved" {
+		t.Fatalf("not-now %#v", r)
+	}
+	x := f.do("kes", "ask.drop", map[string]any{"id": d}).(map[string]any)
+	if x["state"] != "dropped" || x["resolution"] != "dropped" {
+		t.Fatalf("drop %#v", x)
+	}
+	f.fails("conflict", "ask.drop", map[string]any{"id": d})
+	f.fails("conflict", "ask.talk", map[string]any{"id": a})
+	f.fails("conflict", "ask.surface", map[string]any{"id": d})
+	f.fails("not_found", "ask.talk", map[string]any{"id": 4242})
+	f.fails("invalid_request", "ask.talk", map[string]any{"id": "one"})
+	want := []string{
+		"kes: Asked Kev: Ship it?", "kes: Asked Kev: Rename it?", "kes: Asked Kev: Split it?",
+		"kevin: Kev opened a conversation about: Ship it?",
+		"kevin: Kev: not now on “Ship it?” (wrong moment — not a judgment on the ask)",
+		"kes: Withdrew ask: Split it?",
+	}
+	if got := f.notes(c); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("notes:\n%s", strings.Join(got, "\n"))
+	}
+	_ = b
+	// A long question keeps the generated note within the 300-unit note bound.
+	long := strings.Repeat("é", 290) + "?"
+	l := f.add(c, long, false)
+	f.do("kevin", "ask.resolve", map[string]any{"id": l, "choice": "not-now"})
+	var text, detail string
+	_ = f.s.db.QueryRow("select text,detail from notes where card_id=? order by id desc limit 1", c).Scan(&text, &detail)
+	if units(text) > 300 || detail != long || !strings.Contains(text, "…") {
+		t.Fatalf("long note %d %q", units(text), text)
+	}
+}
+
+func TestAskAddRejectsInvalid(t *testing.T) {
+	f := newAskFixture(t)
+	c := f.card("c")
+	act := func(m map[string]any) map[string]any {
+		x := map[string]any{"key": "go", "label": "Go"}
+		for k, v := range m {
+			x[k] = v
+		}
+		return x
+	}
+	ops := func(o ...any) map[string]any { return act(map[string]any{"ops": o}) }
+	base := func(over map[string]any) map[string]any {
+		x := map[string]any{"card": c, "question": "Q?", "actions": []any{act(nil)}}
+		for k, v := range over {
+			x[k] = v
+		}
+		return x
+	}
+	nine := []any{}
+	for i := 0; i < 9; i++ {
+		nine = append(nine, map[string]any{"op": "card.unblock", "id": c})
+	}
+	cases := map[string]map[string]any{
+		"no actions":        base(map[string]any{"actions": []any{}}),
+		"five actions":      base(map[string]any{"actions": []any{act(map[string]any{"key": "a"}), act(map[string]any{"key": "b"}), act(map[string]any{"key": "c"}), act(map[string]any{"key": "d"}), act(map[string]any{"key": "e"})}}),
+		"reserved not-now":  base(map[string]any{"actions": []any{act(map[string]any{"key": "not-now"})}}),
+		"reserved talk":     base(map[string]any{"actions": []any{act(map[string]any{"key": "talk"})}}),
+		"bad key":           base(map[string]any{"actions": []any{act(map[string]any{"key": "Go!"})}}),
+		"dup key":           base(map[string]any{"actions": []any{act(nil), act(nil)}}),
+		"two primaries":     base(map[string]any{"actions": []any{act(map[string]any{"primary": true}), act(map[string]any{"key": "b", "primary": true})}}),
+		"long label":        base(map[string]any{"actions": []any{act(map[string]any{"label": strings.Repeat("x", 121)})}}),
+		"multiline q":       base(map[string]any{"question": "a\nb"}),
+		"long q":            base(map[string]any{"question": strings.Repeat("q", 301)}),
+		"relative link":     base(map[string]any{"link": "docs/x.md"}),
+		"ftp link":          base(map[string]any{"link": "ftp://x/y"}),
+		"unknown field":     base(map[string]any{"priority": 1}),
+		"unknown card":      base(map[string]any{"card": "deadbeef"}),
+		"disallowed op":     base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.add", "project": "p", "title": "t"})}}),
+		"agent op":          base(map[string]any{"actions": []any{ops(map[string]any{"op": "agent.start", "card": c, "name": "x"})}}),
+		"missing lane":      base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.move", "id": c})}}),
+		"bad lane":          base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.move", "id": c, "lane": "done"})}}),
+		"hold_until":        base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.move", "id": c, "lane": "settling", "hold_until": "2030-01-01T00:00:00Z"})}}),
+		"missing reason":    base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.block", "id": c})}}),
+		"missing note text": base(map[string]any{"actions": []any{ops(map[string]any{"op": "note.add", "card": c})}}),
+		"op id unknown":     base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.unblock", "id": "0123456789abcdef"})}}),
+		"set due via ask":   base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.set", "id": c, "due": "2026-01-01"})}}),
+		"nine ops":          base(map[string]any{"actions": []any{ops(nine...)}}),
+	}
+	for name, args := range cases {
+		if _, err := f.s.Handle("ask.add", args); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	var n int
+	_ = f.s.db.QueryRow("select count(*) from asks").Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d asks stored", n)
+	}
+	// An absolute path is a fine link.
+	f.do("kes", "ask.add", base(map[string]any{"link": "/home/kev/docs/plan.md"}))
 }

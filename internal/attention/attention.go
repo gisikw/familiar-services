@@ -26,7 +26,9 @@ create table if not exists notes (id integer primary key,card_id text not null r
 create table if not exists evidence (id integer primary key,card_id text not null references cards(id) on delete cascade,at text not null,kind text not null check(kind in ('pr','commit','shot','run','link')),title text not null,ref text,meta text);
 create table if not exists agents (id integer primary key,card_id text not null references cards(id) on delete cascade,name text not null,model text,host text,harness text,state text not null check(state in ('running','blocked','done','failed','cancelled')),question text,started_at text not null,ended_at text);
 create index if not exists agents_card on agents(card_id);
-create table if not exists meta (key text primary key,value text not null);`
+create table if not exists meta (key text primary key,value text not null);
+create table if not exists asks (id integer primary key,card_id text not null references cards(id) on delete cascade,question text not null,steps text,link text,link_label text,actions text not null,state text not null check(state in ('staged','surfaced','resolved','dropped')),position integer not null,created_at text not null,surfaced_at text,resolved_at text,resolution text);
+create index if not exists asks_state on asks(state,position);`
 
 type Store struct {
 	db  *sql.DB
@@ -629,6 +631,7 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 		"card.move": {"id", "lane", "hold_until"}, "card.block": {"id", "reason"}, "card.unblock": {"id"}, "card.done": {"id", "done"}, "note.add": {"card", "text", "detail"},
 		"evidence.add": {"card", "kind", "title", "ref", "meta"}, "agent.start": {"card", "name", "model", "host", "harness"}, "agent.set": {"card", "name", "state", "question"},
 		"jot.add": {"title", "owner", "due"}, "jot.list": {"all"}, "jot.clear-done": {}, "status": {},
+		"ask.add": {"card", "question", "steps", "link", "link_label", "actions", "stage"}, "ask.list": {"all"}, "ask.resolve": {"id", "choice"}, "ask.talk": {"id"}, "ask.more": {}, "ask.drop": {"id"}, "ask.surface": {"id"},
 	}
 	if names, ok := fields[op]; !ok || !allowed(a, names...) {
 		return nil, code("invalid_request", "invalid arguments")
@@ -723,6 +726,20 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 		return clip(x), e
 	case "status":
 		return s.status()
+	case "ask.add":
+		return s.askAdd(a)
+	case "ask.list":
+		return s.askList(a)
+	case "ask.resolve":
+		return s.askResolve(actor, a)
+	case "ask.talk":
+		return s.askTalk(actor, a)
+	case "ask.more":
+		return s.askMore()
+	case "ask.drop":
+		return s.askDrop(actor, a)
+	case "ask.surface":
+		return s.askSurface(a)
 	case "project.add":
 		return s.projectAdd(a)
 	case "project.set":
@@ -1388,18 +1405,16 @@ func (s *Store) status() (any, error) {
 	if e != nil {
 		return nil, e
 	}
-	needs, inflight := 0, 0
+	inflight := 0
 	for _, r := range rows {
-		x, e := s.concise(r)
-		if e != nil {
-			return nil, e
-		}
-		if x["edge"] == "blocked" || r.Lane == "review" {
-			needs++
-		}
 		if r.Lane == "inflight" {
 			inflight++
 		}
+	}
+	// Needs attention is now Kes's surfaced asks.
+	surfaced, staged, e := s.askCounts()
+	if e != nil {
+		return nil, e
 	}
 	var running, blocked int
 	_ = s.db.QueryRow("select count(*) filter(where a.state='running'),count(*) filter(where a.state='blocked') from agents a join cards c on c.id=a.card_id join projects p on p.slug=c.project where p.hidden=0 and c.lane<>'archived'").Scan(&running, &blocked)
@@ -1416,7 +1431,7 @@ func (s *Store) status() (any, error) {
 			}
 		}
 	}
-	return map[string]any{"agents": map[string]any{"running": running, "blocked": blocked}, "needs_attention": needs, "inflight": inflight, "jots": map[string]any{"open": open, "stale": stale}}, nil
+	return map[string]any{"agents": map[string]any{"running": running, "blocked": blocked}, "needs_attention": surfaced, "asks": map[string]any{"surfaced": surfaced, "staged": staged}, "inflight": inflight, "jots": map[string]any{"open": open, "stale": stale}}, nil
 }
 
 // resolveCardID accepts a full UUID or a hexadecimal prefix of at least 8

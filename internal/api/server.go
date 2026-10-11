@@ -377,7 +377,8 @@ func number(v any) (int64, bool) {
 }
 func isAttention(op string) bool {
 	switch op {
-	case "project.list", "project.get", "project.add", "project.set", "card.list", "card.get", "card.add", "card.set", "card.move", "card.block", "card.unblock", "card.done", "note.add", "evidence.add", "agent.start", "agent.set", "jot.add", "jot.list", "jot.clear-done", "status":
+	case "project.list", "project.get", "project.add", "project.set", "card.list", "card.get", "card.add", "card.set", "card.move", "card.block", "card.unblock", "card.done", "note.add", "evidence.add", "agent.start", "agent.set", "jot.add", "jot.list", "jot.clear-done", "status",
+		"ask.add", "ask.list", "ask.resolve", "ask.talk", "ask.more", "ask.drop", "ask.surface":
 		return true
 	}
 	return false
