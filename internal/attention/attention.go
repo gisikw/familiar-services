@@ -121,6 +121,10 @@ func open(path string, now func() time.Time, tz *time.Location) (*Store, error) 
 			return nil, e
 		}
 	}
+	if e = addColumn(db, "asks", "undo", "text"); e != nil {
+		db.Close()
+		return nil, e
+	}
 	s := &Store{db: db, now: now, tz: tz}
 	tx, e := db.Begin()
 	if e != nil {
@@ -631,7 +635,7 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 		"card.move": {"id", "lane", "hold_until"}, "card.block": {"id", "reason"}, "card.unblock": {"id"}, "card.done": {"id", "done"}, "note.add": {"card", "text", "detail"},
 		"evidence.add": {"card", "kind", "title", "ref", "meta"}, "agent.start": {"card", "name", "model", "host", "harness"}, "agent.set": {"card", "name", "state", "question"},
 		"jot.add": {"title", "owner", "due"}, "jot.list": {"all"}, "jot.clear-done": {}, "status": {},
-		"ask.add": {"card", "question", "steps", "link", "link_label", "actions", "stage"}, "ask.list": {"all"}, "ask.resolve": {"id", "choice"}, "ask.talk": {"id"}, "ask.more": {}, "ask.drop": {"id"}, "ask.surface": {"id"},
+		"ask.add": {"card", "question", "steps", "link", "link_label", "actions", "stage"}, "ask.list": {"all"}, "ask.resolve": {"id", "choice"}, "ask.undo": {"id"}, "ask.talk": {"id"}, "ask.more": {}, "ask.drop": {"id"}, "ask.surface": {"id"},
 	}
 	if names, ok := fields[op]; !ok || !allowed(a, names...) {
 		return nil, code("invalid_request", "invalid arguments")
@@ -732,6 +736,8 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 		return s.askList(a)
 	case "ask.resolve":
 		return s.askResolve(actor, a)
+	case "ask.undo":
+		return s.askUndo(actor, a)
 	case "ask.talk":
 		return s.askTalk(actor, a)
 	case "ask.more":

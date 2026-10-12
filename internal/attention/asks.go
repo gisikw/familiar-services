@@ -8,8 +8,13 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
+
+// undoWindow is how long after a resolve Kev's undo is honored. The UI shows
+// the collapsed row for 5s; the server allows slack for a slow round trip.
+const undoWindow = 2 * time.Minute
 
 // Asks are Kes's inbox to Kev: bounded decisions about one card. At most
 // maxSurfaced are surfaced at a time; the rest are staged until Kev asks for
@@ -29,6 +34,7 @@ var askOps = map[string]struct{ fields, required []string }{
 type askAction struct {
 	Key     string           `json:"key"`
 	Label   string           `json:"label"`
+	Done    string           `json:"done,omitempty"` // past-tense outcome, e.g. "Closed"
 	Primary bool             `json:"primary,omitempty"`
 	Ops     []map[string]any `json:"ops,omitempty"`
 }
@@ -214,8 +220,8 @@ func (s *Store) askAdd(a map[string]any) (any, error) {
 	primaries := 0
 	for _, r := range raw {
 		m, ok := r.(map[string]any)
-		if !ok || !allowed(m, "key", "label", "primary", "ops") {
-			return nil, code("invalid_request", "an action is {key, label, primary?, ops?}")
+		if !ok || !allowed(m, "key", "label", "done", "primary", "ops") {
+			return nil, code("invalid_request", "an action is {key, label, done?, primary?, ops?}")
 		}
 		key, ok := str(m, "key")
 		if !ok || !validKey(key) {
@@ -239,7 +245,14 @@ func (s *Store) askAdd(a map[string]any) (any, error) {
 		if primary {
 			primaries++
 		}
+		done, ok := optstr(m, "done")
+		if !ok || (done != nil && !validUnits(*done, 60, true)) {
+			return nil, code("invalid_request", "action done must be one line of at most 60 characters")
+		}
 		act := askAction{Key: key, Label: lbl, Primary: primary}
+		if done != nil {
+			act.Done = *done
+		}
 		if x, has := m["ops"]; has {
 			ops, ok := x.([]any)
 			if !ok || len(ops) > 8 {
@@ -340,6 +353,9 @@ func (r askRow) wire() map[string]any {
 	actions := []any{}
 	for _, x := range r.Actions {
 		act := map[string]any{"key": x.Key, "label": x.Label}
+		if x.Done != "" {
+			act["done"] = x.Done
+		}
 		if x.Primary {
 			act["primary"] = true
 		}
@@ -435,8 +451,13 @@ func (s *Store) askResolve(actor string, a map[string]any) (any, error) {
 		if e != nil {
 			return nil, e
 		}
+		var snaps []cardSnap
 		resolve := func() error {
-			_, e := tx.Exec("update asks set state='resolved',resolved_at=?,resolution=? where id=?", at, choice, r.ID)
+			undo, e := json.Marshal(askUndoRec{Prev: r.State, Cards: snaps})
+			if e != nil {
+				return e
+			}
+			_, e = tx.Exec("update asks set state='resolved',resolved_at=?,resolution=?,undo=? where id=?", at, choice, string(undo), r.ID)
 			return e
 		}
 		if choice == "not-now" {
@@ -453,6 +474,9 @@ func (s *Store) askResolve(actor string, a map[string]any) (any, error) {
 		}
 		if act == nil {
 			return nil, code("invalid_request", "choice must be one of the ask's action keys or not-now")
+		}
+		if snaps, e = snapCards(tx, act.Ops); e != nil {
+			return nil, e
 		}
 		for _, op := range act.Ops {
 			name, _ := str(op, "op")
@@ -571,4 +595,113 @@ func (s *Store) askMore() (any, error) {
 func (s *Store) askCounts() (surfaced, staged int, e error) {
 	e = s.db.QueryRow("select count(*) filter(where state='surfaced'),count(*) filter(where state='staged') from asks").Scan(&surfaced, &staged)
 	return
+}
+
+// cardSnap is a card's mutable columns before a resolve's ops ran. Undo
+// restores them exactly; notes the ops added stay, and undo appends its own.
+type cardSnap struct {
+	ID                                              string
+	Lane, Title                                     string
+	Summary, Owner, Policy, Blocked, Hold, Due, May sql.NullString
+	Done                                            int
+	Moved                                           string
+}
+
+type askUndoRec struct {
+	Prev  string     `json:"prev"` // state before resolve: surfaced or staged
+	Cards []cardSnap `json:"cards,omitempty"`
+}
+
+const snapCols = "id,lane,title,summary,owner,policy,blocked,hold_until,due,maybe_on,done,moved_at"
+
+func snapCards(tx *sql.Tx, ops []map[string]any) ([]cardSnap, error) {
+	seen := map[string]bool{}
+	out := []cardSnap{}
+	for _, op := range ops {
+		name, _ := str(op, "op")
+		if name == "note.add" {
+			continue
+		}
+		id, _ := str(op, "id")
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		var c cardSnap
+		if e := tx.QueryRow("select "+snapCols+" from cards where id=?", id).Scan(&c.ID, &c.Lane, &c.Title, &c.Summary, &c.Owner, &c.Policy, &c.Blocked, &c.Hold, &c.Due, &c.May, &c.Done, &c.Moved); e != nil {
+			if errors.Is(e, sql.ErrNoRows) {
+				return nil, code("not_found", "card not found")
+			}
+			return nil, e
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// askUndo reverses a resolve within undoWindow: card columns go back to their
+// snapshot, a note records the undo, and the ask returns to where it was
+// (surfaced if there is room, else staged).
+func (s *Store) askUndo(actor string, a map[string]any) (any, error) {
+	id, ok := intArg(a, "id")
+	if !ok {
+		return nil, code("invalid_request", "id must be a positive integer")
+	}
+	v, e := s.write(func(tx *sql.Tx, at string) (any, error) {
+		r, e := loadAsk(tx, id)
+		if e != nil {
+			return nil, e
+		}
+		var raw sql.NullString
+		if e = tx.QueryRow("select undo from asks where id=?", id).Scan(&raw); e != nil {
+			return nil, e
+		}
+		if r.State != "resolved" || !raw.Valid {
+			return nil, code("conflict", "ask is not undoable")
+		}
+		when, e := time.Parse(time.RFC3339Nano, r.Resolved.String)
+		if e != nil || s.now().Sub(when) > undoWindow {
+			return nil, code("conflict", "undo window has passed")
+		}
+		var rec askUndoRec
+		if e = json.Unmarshal([]byte(raw.String), &rec); e != nil {
+			return nil, e
+		}
+		for _, c := range rec.Cards {
+			if _, e = tx.Exec("update cards set lane=?,title=?,summary=?,owner=?,policy=?,blocked=?,hold_until=?,due=?,maybe_on=?,done=?,moved_at=?,updated_at=? where id=?",
+				c.Lane, c.Title, c.Summary, c.Owner, c.Policy, c.Blocked, c.Hold, c.Due, c.May, c.Done, c.Moved, at, c.ID); e != nil {
+				return nil, e
+			}
+			if e = event(tx, c.ID, actor, "undo", at, map[string]any{"ask": r.ID, "lane": c.Lane}); e != nil {
+				return nil, e
+			}
+		}
+		state := "staged"
+		if rec.Prev != "staged" {
+			var surfaced int
+			if e = tx.QueryRow("select count(*) from asks where state='surfaced'").Scan(&surfaced); e != nil {
+				return nil, e
+			}
+			if surfaced < maxSurfaced {
+				state = "surfaced"
+			}
+		}
+		if _, e = tx.Exec("update asks set state=?,resolved_at=null,resolution=null,undo=null where id=?", state, r.ID); e != nil {
+			return nil, e
+		}
+		label := r.Resolution.String
+		for _, x := range r.Actions {
+			if x.Key == label {
+				label = x.Label
+			}
+		}
+		if label == "not-now" {
+			label = "Not now"
+		}
+		return r.ID, addNote(tx, r.Card, actor, at, "Kev undid “"+label+"” on: ", r.Question, "")
+	})
+	if e != nil {
+		return nil, e
+	}
+	return s.ask(v.(int64))
 }

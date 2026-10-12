@@ -752,3 +752,49 @@ func TestAskAddRejectsInvalid(t *testing.T) {
 	// An absolute path is a fine link.
 	f.do("kes", "ask.add", base(map[string]any{"link": "/home/kev/docs/plan.md"}))
 }
+
+func TestAskUndoRestoresCardAndAsk(t *testing.T) {
+	f := newAskFixture(t)
+	c := f.card("M4")
+	x := f.do("kes", "ask.add", map[string]any{"card": c, "question": "Close M4?", "actions": []any{
+		map[string]any{"key": "close", "label": "Close it", "done": "Closed", "primary": true, "ops": []any{
+			map[string]any{"op": "card.move", "id": c, "lane": "archived"},
+			map[string]any{"op": "card.set", "id": c, "owner": "kes"},
+		}},
+		map[string]any{"key": "keep", "label": "Keep open"},
+	}}).(map[string]any)
+	id := x["id"].(int64)
+	if acts := x["actions"].([]any); acts[0].(map[string]any)["done"] != "Closed" || acts[1].(map[string]any)["done"] != nil {
+		t.Fatalf("done labels on wire: %#v", acts)
+	}
+	if _, has := x["actions"].([]any)[0].(map[string]any)["ops"]; has {
+		t.Fatal("ops leaked to wire")
+	}
+	f.do("kevin", "ask.resolve", map[string]any{"id": id, "choice": "close"})
+	got := f.do("kevin", "card.get", map[string]any{"id": c}).(map[string]any)
+	if got["lane"] != "archived" {
+		t.Fatalf("lane %v", got["lane"])
+	}
+	u := f.do("kevin", "ask.undo", map[string]any{"id": id}).(map[string]any)
+	if u["state"] != "surfaced" || u["resolution"] != nil || u["resolved_at"] != nil {
+		t.Fatalf("undone ask %#v", u)
+	}
+	got = f.do("kevin", "card.get", map[string]any{"id": c}).(map[string]any)
+	if got["lane"] != "settling" || got["owner"] != nil && got["owner"] != "kevin" {
+		t.Fatalf("card not restored: lane=%v owner=%v", got["lane"], got["owner"])
+	}
+	n := f.notes(c)
+	if last := n[len(n)-1]; last != "kevin: Kev undid “Close it” on: Close M4?" {
+		t.Fatalf("undo note %q", last)
+	}
+	// undo twice is a conflict; resolve again works
+	f.fails("conflict", "ask.undo", map[string]any{"id": id})
+	f.do("kevin", "ask.resolve", map[string]any{"id": id, "choice": "not-now"})
+	f.do("kevin", "ask.undo", map[string]any{"id": id})
+	// window: an old resolve is not undoable
+	f.do("kevin", "ask.resolve", map[string]any{"id": id, "choice": "keep"})
+	if _, err := f.s.db.Exec("update asks set resolved_at='2020-01-01T00:00:00Z' where id=?", id); err != nil {
+		t.Fatal(err)
+	}
+	f.fails("conflict", "ask.undo", map[string]any{"id": id})
+}
