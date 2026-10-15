@@ -798,3 +798,82 @@ func TestAskUndoRestoresCardAndAsk(t *testing.T) {
 	}
 	f.fails("conflict", "ask.undo", map[string]any{"id": id})
 }
+
+func TestAskForkActionSpawnsOnceAndHasNoUndo(t *testing.T) {
+	f := newAskFixture(t)
+	c := f.card("L1")
+	var got []ForkSpawn
+	f.s.SpawnFork = func(x ForkSpawn) error { got = append(got, x); return nil }
+	fork := map[string]any{"task": "Enable L1 and verify l1 log.", "fresh": true, "target": "instance:01abc"}
+	x := f.do("kes", "ask.add", map[string]any{"card": c, "question": "Turn on L1?", "actions": []any{
+		map[string]any{"key": "go", "label": "Do it", "done": "Started", "primary": true, "fork": fork,
+			"ops": []any{map[string]any{"op": "card.move", "id": c, "lane": "inflight"}}},
+		map[string]any{"key": "no", "label": "Not yet"},
+	}}).(map[string]any)
+	id := x["id"].(int64)
+	acts := x["actions"].([]any)
+	if acts[0].(map[string]any)["fork"] != true || acts[1].(map[string]any)["fork"] != nil {
+		t.Fatalf("fork flag on wire: %#v", acts)
+	}
+	if b, _ := json.Marshal(x); strings.Contains(string(b), "Enable L1") || strings.Contains(string(b), "01abc") {
+		t.Fatalf("fork task/target leaked to wire: %s", b)
+	}
+	f.do("kevin", "ask.resolve", map[string]any{"id": id, "choice": "go"})
+	if len(got) != 1 {
+		t.Fatalf("spawns: %#v", got)
+	}
+	g := got[0]
+	if g.Target != "instance:01abc" || g.Task != "Enable L1 and verify l1 log." || !g.Fresh || g.Label != "Do it" || g.Ask != id || g.Choice != "go" || !strings.HasPrefix(g.ID, fmt.Sprintf("ask-%d-", id)) {
+		t.Fatalf("spawn %#v", g)
+	}
+	if lane := f.do("kevin", "card.get", map[string]any{"id": c}).(map[string]any)["lane"]; lane != "inflight" {
+		t.Fatalf("ops didn't run alongside: %v", lane)
+	}
+	notes := strings.Join(f.notes(c), "\n")
+	if !strings.Contains(notes, "Started a fork (Do it) for: Turn on L1?") {
+		t.Fatalf("notes: %s", notes)
+	}
+	f.fails("conflict", "ask.undo", map[string]any{"id": id})
+	// resolving again is refused; no second spawn
+	if _, err := f.s.HandleAs("kevin", "ask.resolve", map[string]any{"id": id, "choice": "go"}); err == nil || len(got) != 1 {
+		t.Fatalf("second resolve: %v, spawns %d", err, len(got))
+	}
+}
+
+func TestAskForkSpawnFailureLeavesAskUp(t *testing.T) {
+	f := newAskFixture(t)
+	c := f.card("X")
+	fork := map[string]any{"task": "Do X.", "target": "instance:01abc", "label": "x"}
+	id := f.do("kes", "ask.add", map[string]any{"card": c, "question": "X?", "actions": []any{
+		map[string]any{"key": "go", "label": "Go", "fork": fork, "ops": []any{map[string]any{"op": "card.move", "id": c, "lane": "archived"}}},
+	}}).(map[string]any)["id"].(int64)
+	// unwired: refused, nothing changes
+	f.fails("unavailable", "ask.resolve", map[string]any{"id": id, "choice": "go"})
+	f.s.SpawnFork = func(ForkSpawn) error { return errors.New("scheduler down") }
+	if _, err := f.s.HandleAs("kevin", "ask.resolve", map[string]any{"id": id, "choice": "go"}); err == nil {
+		t.Fatal("want error")
+	}
+	if s, _ := f.list(); len(s) != 1 || s[0] != id {
+		t.Fatalf("ask should stay surfaced: %v", s)
+	}
+	if lane := f.do("kevin", "card.get", map[string]any{"id": c}).(map[string]any)["lane"]; lane != "settling" {
+		t.Fatalf("ops committed despite failed spawn: %v", lane)
+	}
+}
+
+func TestAskForkValidation(t *testing.T) {
+	f := newAskFixture(t)
+	c := f.card("V")
+	for _, fork := range []any{
+		"string",
+		map[string]any{"task": "x"},
+		map[string]any{"task": "", "target": "instance:a"},
+		map[string]any{"task": "x", "target": "spawn:foo.service"},
+		map[string]any{"task": "x", "target": "instance:a", "label": strings.Repeat("l", 61)},
+		map[string]any{"task": "x", "target": "instance:a", "fresh": "yes"},
+		map[string]any{"task": "x", "target": "instance:a", "extra": 1},
+		map[string]any{"task": strings.Repeat("t", 8001), "target": "instance:a"},
+	} {
+		f.fails("invalid_request", "ask.add", map[string]any{"card": c, "question": "Q?", "actions": []any{map[string]any{"key": "go", "label": "Go", "fork": fork}}})
+	}
+}

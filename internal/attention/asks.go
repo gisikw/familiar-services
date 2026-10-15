@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -37,7 +39,58 @@ type askAction struct {
 	Done    string           `json:"done,omitempty"` // past-tense outcome, e.g. "Closed"
 	Primary bool             `json:"primary,omitempty"`
 	Ops     []map[string]any `json:"ops,omitempty"`
+	Fork    *askFork         `json:"fork,omitempty"`
 }
+
+// askFork is a one-click fork: picking the action starts a fork of Target
+// (the primary the ask was written from) with Task. A started fork can't be
+// taken back, so an action with a fork has no undo.
+type askFork struct {
+	Task   string `json:"task"`
+	Label  string `json:"label,omitempty"`
+	Fresh  bool   `json:"fresh,omitempty"`
+	Target string `json:"target"`
+}
+
+// ForkSpawn is what SpawnFork receives: a stable ID (one fork per ask, even if
+// a delivery is retried), the instance to fork from, and the fork's brief.
+type ForkSpawn struct {
+	ID, Target, Task, Label string
+	Fresh                   bool
+	Ask                     int64
+	Choice                  string
+}
+
+func validAskFork(raw any) (*askFork, error) {
+	bad := func(msg string) error { return code("invalid_request", "invalid action fork: "+msg) }
+	m, ok := raw.(map[string]any)
+	if !ok || !allowed(m, "task", "label", "fresh", "target") {
+		return nil, bad("a fork is {task, label?, fresh?, target}")
+	}
+	task, ok := str(m, "task")
+	if !ok || strings.TrimSpace(task) == "" || !validUnits(task, 8000, false) {
+		return nil, bad("task must be prose of at most 8000 characters")
+	}
+	label, ok := optstr(m, "label")
+	if !ok || (label != nil && !validUnits(*label, 60, true)) {
+		return nil, bad("label must be one line of at most 60 characters")
+	}
+	fresh, ok := boolean(m, "fresh", false)
+	if !ok {
+		return nil, bad("invalid fresh")
+	}
+	target, ok := str(m, "target")
+	if !ok || !targetRE.MatchString(target) {
+		return nil, bad("target must be instance:<session id> (imp attn ask add fills it in)")
+	}
+	f := &askFork{Task: task, Fresh: fresh, Target: target}
+	if label != nil {
+		f.Label = *label
+	}
+	return f, nil
+}
+
+var targetRE = regexp.MustCompile(`^instance:[A-Za-z0-9._-]{1,128}$`)
 
 // units counts UTF-16 code units, the unit the contract's bounds use.
 func units(x string) int {
@@ -220,8 +273,8 @@ func (s *Store) askAdd(a map[string]any) (any, error) {
 	primaries := 0
 	for _, r := range raw {
 		m, ok := r.(map[string]any)
-		if !ok || !allowed(m, "key", "label", "done", "primary", "ops") {
-			return nil, code("invalid_request", "an action is {key, label, done?, primary?, ops?}")
+		if !ok || !allowed(m, "key", "label", "done", "primary", "ops", "fork") {
+			return nil, code("invalid_request", "an action is {key, label, done?, primary?, ops?, fork?}")
 		}
 		key, ok := str(m, "key")
 		if !ok || !validKey(key) {
@@ -265,6 +318,13 @@ func (s *Store) askAdd(a map[string]any) (any, error) {
 				}
 				act.Ops = append(act.Ops, op)
 			}
+		}
+		if x, has := m["fork"]; has {
+			f, e := validAskFork(x)
+			if e != nil {
+				return nil, e
+			}
+			act.Fork = f
 		}
 		actions = append(actions, act)
 	}
@@ -359,6 +419,9 @@ func (r askRow) wire() map[string]any {
 		if x.Primary {
 			act["primary"] = true
 		}
+		if x.Fork != nil {
+			act["fork"] = true
+		}
 		actions = append(actions, act)
 	}
 	return map[string]any{"id": r.ID, "card": map[string]any{"id": r.Card, "project": r.Project, "title": r.Title}, "question": r.Question, "steps": n(r.Steps), "link": n(r.Link), "link_label": n(r.Label), "actions": actions, "state": r.State, "created_at": r.Created, "surfaced_at": n(r.Surfaced), "resolved_at": n(r.Resolved), "resolution": n(r.Resolution)}
@@ -452,8 +515,9 @@ func (s *Store) askResolve(actor string, a map[string]any) (any, error) {
 			return nil, e
 		}
 		var snaps []cardSnap
+		forked := false
 		resolve := func() error {
-			undo, e := json.Marshal(askUndoRec{Prev: r.State, Cards: snaps})
+			undo, e := json.Marshal(askUndoRec{Prev: r.State, Cards: snaps, Fork: forked})
 			if e != nil {
 				return e
 			}
@@ -491,6 +555,24 @@ func (s *Store) askResolve(actor string, a map[string]any) (any, error) {
 				id, _ = str(args, "card")
 			}
 			if _, e = s.apply(tx, at, actor, name, id, args); e != nil {
+				return nil, e
+			}
+		}
+		if f := act.Fork; f != nil {
+			// Last, inside the transaction: if the scheduler refuses, nothing
+			// above commits and the ask stays up for another try.
+			if s.SpawnFork == nil {
+				return nil, code("unavailable", "starting a fork is unavailable here")
+			}
+			label := f.Label
+			if label == "" {
+				label = act.Label
+			}
+			if e = s.SpawnFork(ForkSpawn{ID: askForkID(r), Target: f.Target, Task: f.Task, Label: label, Fresh: f.Fresh, Ask: r.ID, Choice: act.Key}); e != nil {
+				return nil, e
+			}
+			forked = true
+			if e = addNote(tx, r.Card, "kes", at, "Started a fork ("+label+") for: ", r.Question, ""); e != nil {
 				return nil, e
 			}
 		}
@@ -610,6 +692,7 @@ type cardSnap struct {
 type askUndoRec struct {
 	Prev  string     `json:"prev"` // state before resolve: surfaced or staged
 	Cards []cardSnap `json:"cards,omitempty"`
+	Fork  bool       `json:"fork,omitempty"` // a fork started: not undoable
 }
 
 const snapCols = "id,lane,title,summary,owner,policy,blocked,hold_until,due,maybe_on,done,moved_at"
@@ -667,6 +750,9 @@ func (s *Store) askUndo(actor string, a map[string]any) (any, error) {
 		if e = json.Unmarshal([]byte(raw.String), &rec); e != nil {
 			return nil, e
 		}
+		if rec.Fork {
+			return nil, code("conflict", "that started a fork, which can't be undone")
+		}
 		for _, c := range rec.Cards {
 			if _, e = tx.Exec("update cards set lane=?,title=?,summary=?,owner=?,policy=?,blocked=?,hold_until=?,due=?,maybe_on=?,done=?,moved_at=?,updated_at=? where id=?",
 				c.Lane, c.Title, c.Summary, c.Owner, c.Policy, c.Blocked, c.Hold, c.Due, c.May, c.Done, c.Moved, at, c.ID); e != nil {
@@ -704,4 +790,17 @@ func (s *Store) askUndo(actor string, a map[string]any) (any, error) {
 		return nil, e
 	}
 	return s.ask(v.(int64))
+}
+
+// askForkID is stable for one ask (a retried resolve finds the same event)
+// and unique across asks, even if ids were ever reused: it carries the ask's
+// creation time.
+func askForkID(r askRow) string {
+	stamp := strings.Map(func(c rune) rune {
+		if c >= '0' && c <= '9' {
+			return c
+		}
+		return -1
+	}, r.Created)
+	return fmt.Sprintf("ask-%d-%s", r.ID, stamp)
 }
