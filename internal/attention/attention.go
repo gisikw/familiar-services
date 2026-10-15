@@ -35,6 +35,9 @@ type Store struct {
 	now func() time.Time
 	tz  *time.Location // local zone for jot dates (FAMILIAR_TZ)
 	mu  sync.Mutex
+	// SpawnFork starts a fork when Kev picks an ask action that carries one
+	// (the server wires it to the scheduler). Nil: such a pick is refused.
+	SpawnFork func(ForkSpawn) error
 }
 
 // DefaultTZ is the local zone for jot dates when FAMILIAR_TZ is unset.

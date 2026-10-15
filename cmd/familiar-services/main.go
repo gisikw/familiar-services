@@ -56,6 +56,7 @@ func run(args []string) error {
 			return err
 		}
 		defer sched.Close()
+		attn.SpawnFork = api.AskForkSpawner(sched)
 		pushService, err := push.Open(*stateDir)
 		if err != nil {
 			return err
