@@ -41,6 +41,17 @@ Action JSON: `{"key": "close", "label": "Close it", "primary": true, "ops": [ {"
   `card.block {id, reason}`, `card.unblock {id}`, `note.add {card, text, detail?}`.
   `id`/`card` may be any card (e.g. archive two sibling cards). Validate shape at `ask.add` time
   (op name allowed, required fields present, ids resolve to existing cards).
+- `fork`: optional `{task, label?, fresh?, target}` (Oct 14, 2026): picking the action also
+  starts a fork. `task` is the fork's brief (1..8000 units), `label` its Open-list title (≤60,
+  one line; defaults to the action label), `fresh` skips copying the primary's conversation,
+  `target` is `instance:<primary session id>` (`imp attn ask add` fills it from the lineage
+  root). On resolve, after the ops and inside the same transaction, the store calls
+  `SpawnFork`, which the server wires to a scheduler `type:"fork"` event (id
+  `ask-<id>-<created digits>`, source `attn.ask`): the primary's scheduler extension spawns it
+  with `imp fork`, like `imp schedule --fork`. If the scheduler refuses, nothing commits and
+  the ask stays up. A note `Started a fork (<label>) for: <question>` is added. **No undo**:
+  `ask.undo` on a resolve that started a fork is a `conflict`. On the wire the action carries
+  only `fork: true` (task and target stay server-side).
 
 Operations (added to `HandleAs` switch; same JSON-over-socket transport):
 - `ask.add {card, question, steps?, link?, link_label?, actions:[...], stage?: bool}` → full ask.
