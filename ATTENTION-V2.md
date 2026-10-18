@@ -98,8 +98,9 @@ Only meaningful for `_today` jots.
   works in a minimal Nix closure. Store gets a `tz *time.Location` (test seam alongside `now`).
 - `jot.list {all?: bool}` default view returns, ordered done asc, due asc nulls last, captured_at asc:
   - dated jots with `due <= today` (not archived) — done ones still shown until clear-done;
-  - undated jots with `maybe_on = today` (or `maybe_on` null and captured on today's local date).
-  Hidden (not deleted): dated jots in the future; maybes from earlier days ("faded").
+  - undated jots with `maybe_on = today`, or still on their capture date (or `maybe_on` null)
+    and captured less than 24h ago — a late-night jot survives midnight (2026-10-18).
+  Hidden (not deleted): dated jots in the future; maybes past that ("faded").
   `all:true` returns every non-archived jot.
 - Concise card gains `due: string|null` and `maybe_on: string|null` (always present from the new store).
 - One-time migration (guard with a `meta` key `jots_v2_migrated`): every open (done=0, non-archived)

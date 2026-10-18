@@ -60,16 +60,23 @@ func (s *Store) today() string { return s.now().In(s.tz).Format(dateLayout) }
 
 const dateLayout = "2006-01-02"
 
+// maybeLife is how long an undated maybe stays up after capture.
+const maybeLife = 24 * time.Hour
+
 func validDate(x string) bool {
 	t, e := time.Parse(dateLayout, x)
 	return e == nil && t.Format(dateLayout) == x
 }
 
 // visibleJots is the default jot view: dated jots due today or earlier, and
-// undated maybes for today (maybe_on today, or unset and captured today).
-// Future-dated jots and earlier days' maybes are hidden, not deleted.
+// undated maybes that are still live. A maybe is live on its maybe_on date;
+// one still on its capture date also stays up for 24h after capture, so an
+// intention jotted at 11pm doesn't vanish at midnight (Kev, Oct 2026).
+// Legacy maybes (maybe_on unset) follow the same 24h rule. Future-dated jots
+// and faded maybes are hidden, not deleted.
 func (s *Store) visibleJots(rows []cardRow) []cardRow {
 	today := s.today()
+	now := s.now()
 	out := []cardRow{}
 	for _, r := range rows {
 		switch {
@@ -77,12 +84,15 @@ func (s *Store) visibleJots(rows []cardRow) []cardRow {
 			if r.Due.String <= today {
 				out = append(out, r)
 			}
-		case r.MaybeOn.Valid:
-			if r.MaybeOn.String == today {
-				out = append(out, r)
-			}
+		case r.MaybeOn.Valid && r.MaybeOn.String == today:
+			out = append(out, r)
 		default:
-			if t, e := time.Parse(time.RFC3339Nano, r.Captured); e == nil && t.In(s.tz).Format(dateLayout) == today {
+			t, e := time.Parse(time.RFC3339Nano, r.Captured)
+			if e != nil {
+				continue
+			}
+			onCapture := !r.MaybeOn.Valid || r.MaybeOn.String == t.In(s.tz).Format(dateLayout)
+			if onCapture && now.Sub(t) < maybeLife {
 				out = append(out, r)
 			}
 		}

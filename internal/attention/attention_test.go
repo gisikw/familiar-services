@@ -312,10 +312,16 @@ func TestJotsTodayAndMaybeAcrossLocalMidnight(t *testing.T) {
 	if got != "overdue,due today,maybe walk,legacy" {
 		t.Fatalf("before midnight: %s", got)
 	}
-	// Cross local midnight: the maybes fade, tomorrow's task appears.
+	// Cross local midnight: tomorrow's task appears; the late-night maybes
+	// stay up for 24h from capture rather than vanishing at midnight.
 	c.t = time.Date(2026, 10, 12, 0, 30, 0, 0, chi)
-	if got = strings.Join(jotTitles(t, s, false), ","); got != "overdue,due today,tomorrow" {
+	if got = strings.Join(jotTitles(t, s, false), ","); got != "overdue,due today,tomorrow,maybe walk,legacy" {
 		t.Fatalf("after midnight: %s", got)
+	}
+	// 24h after capture they fade.
+	c.t = time.Date(2026, 10, 12, 23, 31, 0, 0, chi)
+	if got = strings.Join(jotTitles(t, s, false), ","); got != "overdue,due today,tomorrow" {
+		t.Fatalf("after 24h: %s", got)
 	}
 	if got = strings.Join(jotTitles(t, s, true), ","); got != "overdue,due today,tomorrow,maybe walk,legacy" {
 		t.Fatalf("all: %s", got)
