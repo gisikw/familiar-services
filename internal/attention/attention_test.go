@@ -744,6 +744,7 @@ func TestAskAddRejectsInvalid(t *testing.T) {
 		"op id unknown":     base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.unblock", "id": "0123456789abcdef"})}}),
 		"set due via ask":   base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.set", "id": c, "due": "2026-01-01"})}}),
 		"nine ops":          base(map[string]any{"actions": []any{ops(nine...)}}),
+		"done on a card":    base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.done", "id": c})}}),
 	}
 	for name, args := range cases {
 		if _, err := f.s.Handle("ask.add", args); err == nil {

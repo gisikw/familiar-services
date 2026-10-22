@@ -223,6 +223,12 @@ func (s *Store) validAskOp(raw any) (map[string]any, error) {
 		if _, ok := boolean(args, "done", true); !ok {
 			return nil, bad("invalid done")
 		}
+		// The store only lets jots be done; catch it here, not when Kev clicks.
+		var project string
+		_ = s.db.QueryRow("select project from cards where id=?", id).Scan(&project)
+		if project != "_today" {
+			return nil, bad("card.done applies only to jots; to close a card use card.move with lane archived")
+		}
 	case "card.block":
 		if r, ok := str(args, "reason"); !ok || !validText(r, 300, true) {
 			return nil, bad("invalid reason")
