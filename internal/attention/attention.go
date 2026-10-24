@@ -875,17 +875,17 @@ func (s *Store) cardList(a map[string]any) (any, error) {
 	return map[string]any{"items": x[lo:hi], "total": total, "offset": lo, "truncated": hi < total}, e
 }
 
-// whole reads an optional JSON integer argument within [lo, hi].
+// whole reads an optional integer argument within [lo, hi].
 func whole(a map[string]any, k string, d, lo, hi int) (int, bool) {
 	v, has := a[k]
 	if !has {
 		return d, true
 	}
-	f, ok := v.(float64)
-	if !ok || f != float64(int(f)) || int(f) < lo || int(f) > hi {
+	n, ok := anyInt(v)
+	if !ok || n < int64(lo) || n > int64(hi) {
 		return 0, false
 	}
-	return int(f), true
+	return int(n), true
 }
 func (s *Store) projectAdd(a map[string]any) (any, error) {
 	slug, ok := str(a, "slug")

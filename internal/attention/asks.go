@@ -139,8 +139,14 @@ func validLink(x string) bool {
 // intArg reads a positive integer id (json.Number from the socket, float64
 // from generic JSON, or a Go int in tests).
 func intArg(a map[string]any, k string) (int64, bool) {
+	v, ok := anyInt(a[k])
+	return v, ok && v > 0
+}
+
+// anyInt reads a whole number in any of the shapes intArg accepts.
+func anyInt(raw any) (int64, bool) {
 	var v int64
-	switch x := a[k].(type) {
+	switch x := raw.(type) {
 	case json.Number:
 		n, e := strconv.ParseInt(string(x), 10, 64)
 		if e != nil {
@@ -159,7 +165,7 @@ func intArg(a map[string]any, k string) (int64, bool) {
 	default:
 		return 0, false
 	}
-	return v, v > 0
+	return v, true
 }
 
 // validAskOp checks one action op's shape and resolves its card reference to

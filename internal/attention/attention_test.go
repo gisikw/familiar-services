@@ -944,6 +944,11 @@ func TestCardListOrderPagingSince(t *testing.T) {
 	if len(got) != 6 || got[5] != "card 00" || m["offset"] != 64 || m["truncated"] != false {
 		t.Fatalf("page 2: %v %#v", got, m)
 	}
+	// The socket decodes with UseNumber, so integers arrive as json.Number.
+	got, m = titles(list(map[string]any{"order": "created", "offset": json.Number("68"), "limit": json.Number("1")}))
+	if strings.Join(got, ",") != "card 01" || m["truncated"] != true {
+		t.Fatalf("json.Number paging: %v %#v", got, m)
+	}
 	got, m = titles(list(map[string]any{"order": "created", "offset": float64(500)}))
 	if len(got) != 0 || m["offset"] != 70 {
 		t.Fatalf("past end: %v %#v", got, m)
@@ -959,7 +964,7 @@ func TestCardListOrderPagingSince(t *testing.T) {
 		t.Fatalf("since: %v", got)
 	}
 
-	for _, bad := range []map[string]any{{"order": "oldest"}, {"limit": float64(0)}, {"limit": float64(65)}, {"offset": float64(-1)}, {"offset": 1.5}, {"since": "yesterday"}, {"created_since": float64(3)}} {
+	for _, bad := range []map[string]any{{"order": "oldest"}, {"limit": float64(0)}, {"limit": float64(65)}, {"offset": float64(-1)}, {"offset": 1.5}, {"offset": json.Number("1.5")}, {"limit": json.Number("0")}, {"since": "yesterday"}, {"created_since": float64(3)}} {
 		bad["project"] = "p"
 		if _, err := s.Handle("card.list", bad); err == nil {
 			t.Fatalf("accepted %v", bad)
