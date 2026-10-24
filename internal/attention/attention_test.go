@@ -884,3 +884,85 @@ func TestAskForkValidation(t *testing.T) {
 		f.fails("invalid_request", "ask.add", map[string]any{"card": c, "question": "Q?", "actions": []any{map[string]any{"key": "go", "label": "Go", "fork": fork}}})
 	}
 }
+
+func TestCardListOrderPagingSince(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)}
+	s := openTest(t, filepath.Join(t.TempDir(), "a.sqlite"), c)
+	defer s.Close()
+	if _, err := s.Handle("project.add", map[string]any{"slug": "p"}); err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{}
+	for i := 0; i < 70; i++ {
+		c.t = c.t.Add(time.Minute)
+		x, err := s.Handle("card.add", map[string]any{"project": "p", "title": fmt.Sprintf("card %02d", i), "owner": "kevin"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, x.(map[string]any)["id"].(string))
+	}
+	// Touch the oldest card last: "updated" puts it first, "created" doesn't.
+	c.t = c.t.Add(time.Minute)
+	if _, err := s.Handle("card.set", map[string]any{"id": ids[0], "summary": "touched"}); err != nil {
+		t.Fatal(err)
+	}
+	titles := func(x any) ([]string, map[string]any) {
+		m, ok := x.(map[string]any)
+		if !ok {
+			t.Fatalf("want paged map, got %T", x)
+		}
+		out := []string{}
+		for _, v := range m["items"].([]any) {
+			out = append(out, v.(map[string]any)["title"].(string))
+		}
+		return out, m
+	}
+	list := func(a map[string]any) any {
+		t.Helper()
+		a["project"] = "p"
+		x, err := s.Handle("card.list", a)
+		if err != nil {
+			t.Fatalf("%v: %v", a, err)
+		}
+		return x
+	}
+
+	// Unpaged default is unchanged: the 64-row clip in lane order.
+	if m := list(map[string]any{}).(map[string]any); m["total"] != 70 || len(m["items"].([]any)) != 64 || m["items"].([]any)[0].(map[string]any)["title"] != "card 00" {
+		t.Fatalf("default: %#v", m["total"])
+	}
+
+	got, m := titles(list(map[string]any{"order": "updated", "limit": float64(3)}))
+	if strings.Join(got, ",") != "card 00,card 69,card 68" || m["total"] != 70 || m["truncated"] != true {
+		t.Fatalf("updated: %v %#v", got, m["total"])
+	}
+	got, _ = titles(list(map[string]any{"order": "created", "limit": float64(2)}))
+	if strings.Join(got, ",") != "card 69,card 68" {
+		t.Fatalf("created: %v", got)
+	}
+	got, m = titles(list(map[string]any{"order": "created", "offset": float64(64)}))
+	if len(got) != 6 || got[5] != "card 00" || m["offset"] != 64 || m["truncated"] != false {
+		t.Fatalf("page 2: %v %#v", got, m)
+	}
+	got, m = titles(list(map[string]any{"order": "created", "offset": float64(500)}))
+	if len(got) != 0 || m["offset"] != 70 {
+		t.Fatalf("past end: %v %#v", got, m)
+	}
+
+	cut := time.Date(2026, 10, 24, 13, 8, 0, 0, time.UTC).Format(time.RFC3339Nano) // card 67 captured 13:08
+	got, _ = titles(list(map[string]any{"order": "created", "created_since": cut, "limit": float64(64)}))
+	if strings.Join(got, ",") != "card 69,card 68,card 67" {
+		t.Fatalf("created_since: %v", got)
+	}
+	got, _ = titles(list(map[string]any{"order": "updated", "since": cut, "limit": float64(64)}))
+	if strings.Join(got, ",") != "card 00,card 69,card 68,card 67" {
+		t.Fatalf("since: %v", got)
+	}
+
+	for _, bad := range []map[string]any{{"order": "oldest"}, {"limit": float64(0)}, {"limit": float64(65)}, {"offset": float64(-1)}, {"offset": 1.5}, {"since": "yesterday"}, {"created_since": float64(3)}} {
+		bad["project"] = "p"
+		if _, err := s.Handle("card.list", bad); err == nil {
+			t.Fatalf("accepted %v", bad)
+		}
+	}
+}

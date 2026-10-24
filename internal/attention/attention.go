@@ -10,6 +10,7 @@ import (
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -644,7 +645,7 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 	}
 	fields := map[string][]string{
 		"project.list": {"hidden"}, "project.get": {"slug"}, "project.add": {"slug", "label", "default_policy", "repo"}, "project.set": {"slug", "label", "default_policy", "repo"},
-		"card.list": {"project", "lane", "owner", "edge", "q"}, "card.get": {"id"}, "card.add": {"project", "title", "lane", "summary", "owner", "policy"}, "card.set": {"id", "title", "summary", "owner", "policy", "due", "maybe_on"},
+		"card.list": {"project", "lane", "owner", "edge", "q", "order", "offset", "limit", "since", "created_since"}, "card.get": {"id"}, "card.add": {"project", "title", "lane", "summary", "owner", "policy"}, "card.set": {"id", "title", "summary", "owner", "policy", "due", "maybe_on"},
 		"card.move": {"id", "lane", "hold_until"}, "card.block": {"id", "reason"}, "card.unblock": {"id"}, "card.done": {"id", "done"}, "note.add": {"card", "text", "detail"},
 		"evidence.add": {"card", "kind", "title", "ref", "meta"}, "agent.start": {"card", "name", "model", "host", "harness"}, "agent.set": {"card", "name", "state", "question"},
 		"jot.add": {"title", "owner", "due"}, "jot.list": {"all"}, "jot.clear-done": {}, "status": {},
@@ -795,9 +796,65 @@ func (s *Store) cardList(a map[string]any) (any, error) {
 		w = append(w, "(instr(lower(c.title),?)>0 or instr(lower(coalesce(c.summary,'')),?)>0)")
 		args = append(args, strings.ToLower(x), strings.ToLower(x))
 	}
+	// order: "lane" (default; lane, then moved_at asc, as the board reads),
+	// "updated" (newest touch first) or "created" (newest capture first).
+	order := "lane"
+	if v, has := a["order"]; has {
+		x, ok := v.(string)
+		if !ok || !one(x, "lane", "updated", "created") {
+			return nil, code("invalid_request", "invalid order")
+		}
+		order = x
+	}
+	offset, ok := whole(a, "offset", 0, 0, 1<<30)
+	if !ok {
+		return nil, code("invalid_request", "invalid offset")
+	}
+	limit, ok := whole(a, "limit", 64, 1, 64)
+	if !ok {
+		return nil, code("invalid_request", "invalid limit")
+	}
+	_, paged := a["offset"]
+	if _, has := a["limit"]; has {
+		paged = true
+	}
+	var since, createdSince int64
+	for k, dst := range map[string]*int64{"since": &since, "created_since": &createdSince} {
+		if v, has := a[k]; has {
+			x, ok := v.(string)
+			t, err := time.Parse(time.RFC3339Nano, x)
+			if !ok || err != nil {
+				return nil, code("invalid_request", "invalid "+k)
+			}
+			*dst = t.UnixMilli()
+		}
+	}
 	rows, e := s.cards(strings.Join(w, " and ")+" order by c.lane,c.moved_at asc,c.captured_at asc", args...)
 	if e != nil {
 		return nil, e
+	}
+	if since != 0 || createdSince != 0 {
+		kept := rows[:0]
+		for _, r := range rows {
+			if (since == 0 || parseMS(r.Updated) >= since) && (createdSince == 0 || parseMS(r.Captured) >= createdSince) {
+				kept = append(kept, r)
+			}
+		}
+		rows = kept
+	}
+	// Timestamps are RFC3339Nano, which trims trailing zeros, so sort on
+	// parsed instants rather than the stored text.
+	switch order {
+	case "updated":
+		sort.SliceStable(rows, func(i, j int) bool {
+			ui, uj := parseMS(rows[i].Updated), parseMS(rows[j].Updated)
+			if ui != uj {
+				return ui > uj
+			}
+			return parseMS(rows[i].Captured) > parseMS(rows[j].Captured)
+		})
+	case "created":
+		sort.SliceStable(rows, func(i, j int) bool { return parseMS(rows[i].Captured) > parseMS(rows[j].Captured) })
 	}
 	x, e := s.concises(rows)
 	if edge, ok := str(a, "edge"); ok {
@@ -809,7 +866,26 @@ func (s *Store) cardList(a map[string]any) (any, error) {
 		}
 		x = z
 	}
-	return clip(x), e
+	if !paged {
+		return clip(x), e
+	}
+	total := len(x)
+	lo := min(offset, total)
+	hi := min(lo+limit, total)
+	return map[string]any{"items": x[lo:hi], "total": total, "offset": lo, "truncated": hi < total}, e
+}
+
+// whole reads an optional JSON integer argument within [lo, hi].
+func whole(a map[string]any, k string, d, lo, hi int) (int, bool) {
+	v, has := a[k]
+	if !has {
+		return d, true
+	}
+	f, ok := v.(float64)
+	if !ok || f != float64(int(f)) || int(f) < lo || int(f) > hi {
+		return 0, false
+	}
+	return int(f), true
 }
 func (s *Store) projectAdd(a map[string]any) (any, error) {
 	slug, ok := str(a, "slug")
