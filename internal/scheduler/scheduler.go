@@ -362,6 +362,16 @@ func (s *Store) Requeue(target string) error {
 	return err
 }
 func (s *Store) Claim(target string, now int64) (*Event, error) {
+	return s.ClaimNext(target, now, false)
+}
+
+// ClaimNext claims the next due event for target. Anything that will start a
+// turn (a wake, or under Do Disturb a quiet fork return) goes before soft
+// notes, so a backlog of soft notes never makes a wake wait behind it (Oct 24:
+// ~25 soft notifies, requeued on a restart, held two merges for ~10 min at one
+// delivery per 15s). softOnly claims only events that will not start a turn,
+// for when wakes are being spaced out.
+func (s *Store) ClaimNext(target string, now int64, softOnly bool) (*Event, error) {
 	target = NormalizeTarget(target)
 	if strings.HasPrefix(target, "spawn:") {
 		return nil, nil
@@ -382,7 +392,16 @@ func (s *Store) Claim(target string, now int64) (*Event, error) {
 		// so neither interrupts; its merge is what DND governs.
 		query += ` AND (urgency='soft' OR type='fork')`
 	}
-	e, err := scanEvent(tx.QueryRow(query+` ORDER BY priority,due_at,created_at LIMIT 1`, target, now))
+	disturb := dnd != nil && dnd.Mode == DNDDisturb
+	// wakes: 1 if this row would start a turn in the target.
+	wakes := `(urgency!='soft')`
+	if disturb {
+		wakes = `(urgency!='soft' OR type='merge')`
+	}
+	if softOnly {
+		query += ` AND NOT ` + wakes
+	}
+	e, err := scanEvent(tx.QueryRow(query+` ORDER BY `+wakes+` DESC,priority,due_at,created_at LIMIT 1`, target, now))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

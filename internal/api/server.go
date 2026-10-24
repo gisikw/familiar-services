@@ -220,23 +220,31 @@ func (s *Server) deliveryLoop(ctx context.Context) {
 }
 func (s *Server) pump() {
 	s.mu.Lock()
-	clients := make([]*client, 0, len(s.clients))
+	// Wakes (turn starters) are spaced 15s apart per target. Soft notes start
+	// no turn, so they are never throttled and never reset the wake spacing:
+	// a soft backlog drains about one per second instead of one per 15s.
+	type pending struct {
+		c        *client
+		softOnly bool
+	}
+	clients := make([]pending, 0, len(s.clients))
 	for _, c := range s.clients {
-		if time.Since(s.lastDelivery[c.target]) >= 15*time.Second {
-			clients = append(clients, c)
-		}
+		clients = append(clients, pending{c, time.Since(s.lastDelivery[c.target]) < 15*time.Second})
 	}
 	s.mu.Unlock()
-	for _, c := range clients {
-		e, err := s.services.Scheduler.Claim(c.target, time.Now().UnixMilli())
+	for _, p := range clients {
+		c := p.c
+		e, err := s.services.Scheduler.ClaimNext(c.target, time.Now().UnixMilli(), p.softOnly)
 		if err != nil {
 			log.Printf("scheduler delivery: %v", err)
 			continue
 		}
 		if e != nil {
-			s.mu.Lock()
-			s.lastDelivery[c.target] = time.Now()
-			s.mu.Unlock()
+			if e.Urgency != "soft" {
+				s.mu.Lock()
+				s.lastDelivery[c.target] = time.Now()
+				s.mu.Unlock()
+			}
 			if c.send(map[string]any{"event": e}) != nil {
 				_ = c.Close()
 			}

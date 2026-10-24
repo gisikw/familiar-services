@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -222,5 +223,40 @@ func TestDoDisturbWakesQuietMerges(t *testing.T) {
 	}
 	if _, err := s.DNDSetMode("instance:a", true, "familiar", "loud", nil); err == nil {
 		t.Fatal("bad mode accepted")
+	}
+}
+
+// Oct 24: ~25 soft notifies queued ahead of two quiet merges under Do Disturb
+// kept the merges waiting ~10 min. Turn starters now go first.
+func TestWakesClaimedBeforeSoftBacklog(t *testing.T) {
+	s := openTest(t)
+	body := `{"summary":"done","forkSessionId":"fork","forkSessionFile":"/tmp/fork.jsonl","branchEntryId":"branch","firstEntryId":"first","lastEntryId":"last","mergedAt":"2026-01-01T00:00:00Z","turnCount":2,"forkedFurther":false}`
+	now := time.Now().UnixMilli()
+	for i := 0; i < 3; i++ {
+		_, _, _ = s.Enqueue(Enqueue{ID: fmt.Sprintf("note%d", i), Target: "instance:a", Summary: "fyi", Urgency: "soft", DueAt: now - 60_000 + int64(i)})
+	}
+	_, _, _ = s.Enqueue(Enqueue{ID: "merge", Target: "instance:a", Type: "merge", Summary: "done", Body: body, Urgency: "soft"})
+	_, _, _ = s.Enqueue(Enqueue{ID: "wake", Target: "instance:a", Summary: "wake"})
+	// Without Do Disturb the wake jumps the notes; the quiet merge stays in line.
+	if e, _ := s.Claim("instance:a", now+1000); e == nil || e.ID != "wake" {
+		t.Fatalf("wake not first: %#v", e)
+	}
+	if e, _ := s.Claim("instance:a", now+1000); e == nil || e.ID != "note0" {
+		t.Fatalf("soft order changed: %#v", e)
+	}
+	day := int64(time.Hour / time.Millisecond)
+	if _, err := s.DNDSetMode("instance:a", true, "familiar", DNDDisturb, &day); err != nil {
+		t.Fatal(err)
+	}
+	// While wakes are being spaced, only non-turn-starters are claimed.
+	if e, _ := s.ClaimNext("instance:a", now+1000, true); e == nil || e.ID != "note1" {
+		t.Fatalf("softOnly claimed: %#v", e)
+	}
+	// Under Do Disturb the quiet merge is a turn starter and goes next.
+	if e, _ := s.Claim("instance:a", now+1000); e == nil || e.ID != "merge" || e.Urgency != "wake" {
+		t.Fatalf("merge not ahead of notes: %#v", e)
+	}
+	if e, _ := s.ClaimNext("instance:a", now+1000, true); e == nil || e.ID != "note2" {
+		t.Fatalf("last note: %#v", e)
 	}
 }
