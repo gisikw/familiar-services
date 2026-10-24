@@ -174,6 +174,11 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 		if err != nil {
 			return Event{}, false, err
 		}
+		if resolved != in.Target && in.Type != "fork" && fromOtherInstance(in.Origin, in.Target) {
+			// A note from a sibling (or the parent) for a fork that already came
+			// home: nobody is there to read it, and its parent didn't ask for it.
+			return Event{}, false, fmt.Errorf("%s already merged into %s; note not delivered", in.Target, resolved)
+		}
 		if resolved != in.Target {
 			in.Summary = "(for merged fork " + shortID(in.Target) + ") " + in.Summary
 			in.Target = resolved
@@ -239,12 +244,23 @@ func (s *Store) Enqueue(in Enqueue) (Event, bool, error) {
 
 const eventColumns = `id,due_at,target,origin,source,priority,type,summary,body,urgency,state,created_at,rule,series`
 
+// shortID keeps 13 characters: instance ids are UUIDv7, so the first 8 are a
+// timestamp and forks started together share them.
 func shortID(target string) string {
 	id := strings.TrimPrefix(target, "instance:")
-	if len(id) > 8 {
-		return id[:8]
+	if len(id) > 13 {
+		return id[:13]
 	}
 	return id
+}
+
+var instanceIDRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// fromOtherInstance: the event was enqueued by a Pi instance other than the
+// target itself (a sibling fork or the parent), as opposed to the target's
+// own schedules or a service acting for it (golem, fleet, attention).
+func fromOtherInstance(origin, target string) bool {
+	return instanceIDRE.MatchString(origin) && "instance:"+origin != NormalizeTarget(target)
 }
 
 // Resolve follows merged-fork forwarding: an event for a fork that has come
@@ -280,6 +296,30 @@ func (s *Store) recordMerge(fork, parent string) error {
 	defer tx.Rollback()
 	if _, err = tx.Exec(`INSERT INTO merged(fork,parent,merged_at) VALUES(?,?,?) ON CONFLICT(fork) DO UPDATE SET parent=excluded.parent,merged_at=excluded.merged_at`, fork, parent, s.now().UnixMilli()); err != nil {
 		return err
+	}
+	// Notes other instances sent the fork that it never read are dropped, not
+	// forwarded: siblings' deploy-lock chatter used to land on the primary.
+	// Kept as acked rows (with a marker) for the record.
+	rows, err := tx.Query(`SELECT id, origin FROM events WHERE target=? AND state IN ('pending','delivered') AND type NOT IN ('fork','merge')`, fork)
+	if err != nil {
+		return err
+	}
+	var drop []string
+	for rows.Next() {
+		var id, origin string
+		if err = rows.Scan(&id, &origin); err != nil {
+			rows.Close()
+			return err
+		}
+		if fromOtherInstance(origin, fork) {
+			drop = append(drop, id)
+		}
+	}
+	rows.Close()
+	for _, id := range drop {
+		if _, err = tx.Exec(`UPDATE events SET state='acked', summary='(undelivered: fork merged) '||summary WHERE id=?`, id); err != nil {
+			return err
+		}
 	}
 	prefix := "(for merged fork " + shortID(fork) + ") "
 	if _, err = tx.Exec(`UPDATE events SET target=?, state='pending', summary=?||summary WHERE target=? AND state IN ('pending','delivered') AND type!='fork'`, parent, prefix, fork); err != nil {

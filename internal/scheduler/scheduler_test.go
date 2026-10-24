@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -258,5 +259,36 @@ func TestWakesClaimedBeforeSoftBacklog(t *testing.T) {
 	}
 	if e, _ := s.ClaimNext("instance:a", now+1000, true); e == nil || e.ID != "note2" {
 		t.Fatalf("last note: %#v", e)
+	}
+}
+
+// Oct 24: siblings' deploy-lock notes, unread by a busy fork, were forwarded to
+// the primary when the fork merged (60 of them in one morning). Notes another
+// instance sent are dropped at merge and refused afterwards; the fork's own
+// schedules and service events for it still forward.
+func TestMergedForkDropsSiblingNotes(t *testing.T) {
+	s := openTest(t)
+	const fork = "01a16e85-c8cd-701d-9434-8d062cabd3ce"
+	const sib = "01a16e85-de4a-7214-8a33-b240f1cc30a1"
+	s.Enqueue(Enqueue{ID: "sib-note", Target: "instance:" + fork, Origin: sib, Summary: "deploy lock released", Urgency: "soft"})
+	s.Enqueue(Enqueue{ID: "own-reminder", Target: "instance:" + fork, Origin: fork, Summary: "check the deploy"})
+	s.Enqueue(Enqueue{ID: "golem", Target: "instance:" + fork, Origin: fork, Source: "golem", Summary: "agent settled"})
+	s.Enqueue(Enqueue{ID: "svc", Target: "instance:" + fork, Summary: "service note"})
+	if _, _, err := s.Enqueue(Enqueue{ID: "m", Target: "instance:parent", Type: "merge", Summary: "home", Body: mergeBody(fork)}); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.Get("sib-note"); e.State != "acked" || e.Target != "instance:"+fork || !strings.HasPrefix(e.Summary, "(undelivered: fork merged) ") {
+		t.Fatalf("sibling note not dropped: %#v", e)
+	}
+	for _, id := range []string{"own-reminder", "golem", "svc"} {
+		if e, _ := s.Get(id); e.Target != "instance:parent" || e.State != "pending" || e.Summary[:31] != "(for merged fork 01a16e85-c8cd)" {
+			t.Fatalf("%s not forwarded: %#v", id, e)
+		}
+	}
+	if _, _, err := s.Enqueue(Enqueue{Target: "instance:" + fork, Origin: sib, Summary: "late lock note"}); err == nil || !strings.Contains(err.Error(), "already merged") {
+		t.Fatalf("late sibling note should be refused, got %v", err)
+	}
+	if late, _, err := s.Enqueue(Enqueue{Target: "instance:" + fork, Source: "golem", Summary: "late settle"}); err != nil || late.Target != "instance:parent" {
+		t.Fatalf("late service event should forward: %#v %v", late, err)
 	}
 }
