@@ -54,7 +54,11 @@ type Enqueue struct {
 	Rule string `json:"rule"`
 }
 type DND struct {
-	Enabled   bool   `json:"enabled"`
+	Enabled bool `json:"enabled"`
+	// Mode is "quiet" (Do Not Disturb: hold interruptions) or "disturb" (Do
+	// Disturb: quiet fork returns wake the target instead of waiting for the
+	// next user turn). One row per target, so the two are mutually exclusive.
+	Mode      string `json:"mode"`
 	SetBy     string `json:"setBy"`
 	SetAt     int64  `json:"setAt"`
 	ExpiresAt int64  `json:"expiresAt"`
@@ -100,6 +104,7 @@ func Open(stateDir string) (*Store, error) {
 		`ALTER TABLE events ADD COLUMN urgency TEXT NOT NULL DEFAULT 'wake' CHECK(urgency IN ('wake','soft'))`,
 		`ALTER TABLE events ADD COLUMN rule TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE events ADD COLUMN series TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE dnd ADD COLUMN mode TEXT NOT NULL DEFAULT 'quiet'`,
 	} {
 		if _, err = db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -371,7 +376,7 @@ func (s *Store) Claim(target string, now int64) (*Event, error) {
 	}
 	defer tx.Rollback()
 	query := `SELECT ` + eventColumns + ` FROM events WHERE target=? AND state='pending' AND due_at<=?`
-	if dnd != nil {
+	if dnd != nil && dnd.Mode != DNDDisturb {
 		// DND holds interruptions. Soft notes ride the next user turn, and a
 		// scheduled fork runs in the background without a turn in the target,
 		// so neither interrupts; its merge is what DND governs.
@@ -384,7 +389,13 @@ func (s *Store) Claim(target string, now int64) (*Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.Exec(`UPDATE events SET state='delivered' WHERE id=? AND state='pending'`, e.ID); err != nil {
+	if dnd != nil && dnd.Mode == DNDDisturb && e.Type == "merge" && e.Urgency == "soft" {
+		// Do Disturb: a quiet fork return is delivered as a wake, so it starts
+		// a turn instead of sitting until Kev next speaks. Stored, so a
+		// redelivery after a reconnect is a wake too.
+		e.Urgency = "wake"
+	}
+	if _, err = tx.Exec(`UPDATE events SET state='delivered', urgency=? WHERE id=? AND state='pending'`, e.Urgency, e.ID); err != nil {
 		return nil, err
 	}
 	if e.Rule != "" {
@@ -415,7 +426,7 @@ func (s *Store) Claim(target string, now int64) (*Event, error) {
 }
 func (s *Store) DNDGet(target string) (*DND, error) {
 	var d DND
-	err := s.db.QueryRow(`SELECT set_by,set_at,expires_at FROM dnd WHERE target=?`, NormalizeTarget(target)).Scan(&d.SetBy, &d.SetAt, &d.ExpiresAt)
+	err := s.db.QueryRow(`SELECT set_by,set_at,expires_at,mode FROM dnd WHERE target=?`, NormalizeTarget(target)).Scan(&d.SetBy, &d.SetAt, &d.ExpiresAt, &d.Mode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -430,7 +441,26 @@ func (s *Store) DNDGet(target string) (*DND, error) {
 	d.Enabled = true
 	return &d, nil
 }
+
+const (
+	DNDQuiet   = "quiet"
+	DNDDisturb = "disturb"
+)
+
 func (s *Store) DNDSet(target string, enabled bool, setBy string, durationMS *int64) (*DND, error) {
+	return s.DNDSetMode(target, enabled, setBy, DNDQuiet, durationMS)
+}
+
+// DNDSetMode sets quiet (DND) or disturb mode. The familiar may hold DND for
+// at most two hours; it may hold Do Disturb for up to a day, since that only
+// makes it more reachable.
+func (s *Store) DNDSetMode(target string, enabled bool, setBy, mode string, durationMS *int64) (*DND, error) {
+	if mode == "" {
+		mode = DNDQuiet
+	}
+	if mode != DNDQuiet && mode != DNDDisturb {
+		return nil, errors.New("mode must be quiet or disturb")
+	}
 	target = NormalizeTarget(target)
 	if !ValidTarget(target) || strings.HasPrefix(target, "spawn:") {
 		return nil, errors.New("DND requires an instance target")
@@ -452,12 +482,16 @@ func (s *Store) DNDSet(target string, enabled bool, setBy string, durationMS *in
 	if dur <= 0 {
 		return nil, errors.New("duration_ms must be positive")
 	}
-	if setBy == "familiar" && dur > 2*60*60*1000 {
-		dur = 2 * 60 * 60 * 1000
+	limit := int64(2 * 60 * 60 * 1000)
+	if mode == DNDDisturb {
+		limit = 24 * 60 * 60 * 1000
+	}
+	if setBy == "familiar" && dur > limit {
+		dur = limit
 	}
 	now := s.now().UnixMilli()
-	d := &DND{true, setBy, now, now + dur}
-	_, err := s.db.Exec(`INSERT INTO dnd(target,set_by,set_at,expires_at) VALUES(?,?,?,?) ON CONFLICT(target) DO UPDATE SET set_by=excluded.set_by,set_at=excluded.set_at,expires_at=excluded.expires_at`, target, setBy, d.SetAt, d.ExpiresAt)
+	d := &DND{Enabled: true, Mode: mode, SetBy: setBy, SetAt: now, ExpiresAt: now + dur}
+	_, err := s.db.Exec(`INSERT INTO dnd(target,set_by,set_at,expires_at,mode) VALUES(?,?,?,?,?) ON CONFLICT(target) DO UPDATE SET set_by=excluded.set_by,set_at=excluded.set_at,expires_at=excluded.expires_at,mode=excluded.mode`, target, setBy, d.SetAt, d.ExpiresAt, mode)
 	return d, err
 }
 

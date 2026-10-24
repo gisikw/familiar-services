@@ -183,3 +183,44 @@ func TestMergedForkForwarding(t *testing.T) {
 		t.Fatalf("resolve live: %s", r)
 	}
 }
+
+func TestDoDisturbWakesQuietMerges(t *testing.T) {
+	s := openTest(t)
+	body := `{"summary":"done","forkSessionId":"fork","forkSessionFile":"/tmp/fork.jsonl","branchEntryId":"branch","firstEntryId":"first","lastEntryId":"last","mergedAt":"2026-01-01T00:00:00Z","turnCount":2,"forkedFurther":false}`
+	day := int64(30 * time.Hour / time.Millisecond)
+	d, err := s.DNDSetMode("instance:a", true, "familiar", DNDDisturb, &day)
+	if err != nil || d.Mode != DNDDisturb || d.ExpiresAt-d.SetAt != int64(24*time.Hour/time.Millisecond) {
+		t.Fatalf("set disturb: %#v %v", d, err)
+	}
+	if got, _ := s.DNDGet("instance:a"); got == nil || got.Mode != DNDDisturb {
+		t.Fatalf("get disturb: %#v", got)
+	}
+	// Disturb is not DND: wakes pass.
+	_, _, _ = s.Enqueue(Enqueue{ID: "wake", Target: "instance:a", Summary: "wake"})
+	if e, _ := s.Claim("instance:a", time.Now().UnixMilli()); e == nil || e.ID != "wake" {
+		t.Fatalf("wake held under disturb: %#v", e)
+	}
+	_, _, _ = s.Enqueue(Enqueue{ID: "merge", Target: "instance:a", Type: "merge", Summary: "done", Body: body, Urgency: "soft"})
+	if e, _ := s.Claim("instance:a", time.Now().UnixMilli()); e == nil || e.ID != "merge" || e.Urgency != "wake" {
+		t.Fatalf("quiet merge not upgraded: %#v", e)
+	}
+	if e, _ := s.Get("merge"); e.Urgency != "wake" {
+		t.Fatalf("upgrade not stored: %#v", e)
+	}
+	// Other soft notes stay soft.
+	_, _, _ = s.Enqueue(Enqueue{ID: "note", Target: "instance:a", Summary: "fyi", Urgency: "soft"})
+	if e, _ := s.Claim("instance:a", time.Now().UnixMilli()); e == nil || e.Urgency != "soft" {
+		t.Fatalf("soft note changed: %#v", e)
+	}
+	// Kev's DND replaces it; quiet merges stay quiet.
+	if d, _ := s.DNDSet("instance:a", true, "user", nil); d.Mode != DNDQuiet {
+		t.Fatalf("dnd did not replace disturb: %#v", d)
+	}
+	_, _, _ = s.Enqueue(Enqueue{ID: "merge2", Target: "instance:a", Type: "merge", Summary: "done", Body: body, Urgency: "soft"})
+	if e, _ := s.Claim("instance:a", time.Now().UnixMilli()); e == nil || e.Urgency != "soft" {
+		t.Fatalf("merge upgraded under DND: %#v", e)
+	}
+	if _, err := s.DNDSetMode("instance:a", true, "familiar", "loud", nil); err == nil {
+		t.Fatal("bad mode accepted")
+	}
+}

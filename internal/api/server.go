@@ -333,11 +333,12 @@ func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 			enabled = x
 		}
 		setBy, _ := r.Args["set_by"].(string)
+		mode, _ := r.Args["mode"].(string)
 		var duration *int64
 		if x, ok := number(r.Args["duration_ms"]); ok {
 			duration = &x
 		}
-		return s.services.Scheduler.DNDSet(target, enabled, setBy, duration)
+		return s.services.Scheduler.DNDSetMode(target, enabled, setBy, mode, duration)
 	default:
 		return nil, &attention.CodedError{Code: "invalid_request", Err: errors.New("unknown operation")}
 	}
