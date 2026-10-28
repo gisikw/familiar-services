@@ -211,10 +211,30 @@ type sendInput struct {
 	// Session is the sending Familiar instance (Pi session id); the phone
 	// opens that session on tap and falls back to the primary if it's gone.
 	Session string
+	// URL, when set, is what a tap opens instead of the session (in the
+	// phone's browser, never inside the shell): e.g. a host's run-approval page.
+	URL string
+}
+
+// tapURL accepts only https on gisi.network or a subdomain, no credentials,
+// no explicit port other than 443.
+func tapURL(raw string) bool {
+	if len(raw) > 512 {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Opaque != "" {
+		return false
+	}
+	if p := u.Port(); p != "" && p != "443" {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return h == "gisi.network" || (strings.HasSuffix(h, ".gisi.network") && !strings.HasPrefix(h, "."))
 }
 
 func parseSend(args map[string]any) (sendInput, error) {
-	if !only(args, "title", "body", "threadId", "sound", "session") {
+	if !only(args, "title", "body", "threadId", "sound", "session", "url") {
 		return sendInput{}, coded("invalid_request", "invalid arguments")
 	}
 	var in sendInput
@@ -229,7 +249,12 @@ func parseSend(args map[string]any) (sendInput, error) {
 			return in, coded("invalid_request", "invalid session")
 		}
 	}
-	for name, destination := range map[string]*string{"title": &in.Title, "threadId": &in.ThreadID, "session": &in.Session} {
+	if value, exists := args["url"]; exists {
+		if x, ok := value.(string); !ok || !tapURL(x) {
+			return in, coded("invalid_request", "invalid url (https on gisi.network only)")
+		}
+	}
+	for name, destination := range map[string]*string{"title": &in.Title, "threadId": &in.ThreadID, "session": &in.Session, "url": &in.URL} {
 		if value, exists := args[name]; exists {
 			x, ok := value.(string)
 			if !ok {
@@ -251,6 +276,7 @@ func parseSend(args map[string]any) (sendInput, error) {
 type payload struct {
 	APS     aps    `json:"aps"`
 	Session string `json:"session,omitempty"`
+	URL     string `json:"url,omitempty"`
 }
 type aps struct {
 	Alert    alert  `json:"alert"`
@@ -288,7 +314,7 @@ func (s *Service) send(ctx context.Context, args map[string]any) (any, error) {
 		return nil, err
 	}
 
-	message := payload{APS: aps{Alert: alert{Title: in.Title, Body: in.Body}, ThreadID: in.ThreadID}, Session: in.Session}
+	message := payload{APS: aps{Alert: alert{Title: in.Title, Body: in.Body}, ThreadID: in.ThreadID}, Session: in.Session, URL: in.URL}
 	if in.Sound {
 		message.APS.Sound = "default"
 	}

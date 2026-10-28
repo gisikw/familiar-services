@@ -121,7 +121,7 @@ func TestSendHTTP2HeadersAndPayload(t *testing.T) {
 	if _, err := s.Handle(context.Background(), "push.register", map[string]any{"token": device, "platform": "ios"}); err != nil {
 		t.Fatal(err)
 	}
-	result, err := s.Handle(context.Background(), "push.send", map[string]any{"title": "Hello", "body": "Kevin", "threadId": "familiar", "session": "01a0da45-0fb2-727c-830e-d3f295772c3b"})
+	result, err := s.Handle(context.Background(), "push.send", map[string]any{"title": "Hello", "body": "Kevin", "threadId": "familiar", "session": "01a0da45-0fb2-727c-830e-d3f295772c3b", "url": "https://smaug.fort.gisi.network/runs/aaaaaaaaaaaa"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +147,26 @@ func TestSendHTTP2HeadersAndPayload(t *testing.T) {
 	}
 	if got["session"] != "01a0da45-0fb2-727c-830e-d3f295772c3b" {
 		t.Fatalf("sending session not carried for tap deep link: %#v", got)
+	}
+	if got["url"] != "https://smaug.fort.gisi.network/runs/aaaaaaaaaaaa" {
+		t.Fatalf("tap url not carried: %#v", got)
+	}
+}
+
+func TestTapURL(t *testing.T) {
+	for _, ok := range []string{"https://smaug.fort.gisi.network/runs/e88bba800ad0", "https://gisi.network/", "https://a.gisi.network:443/x"} {
+		if !tapURL(ok) {
+			t.Fatalf("%s refused", ok)
+		}
+	}
+	for _, bad := range []string{"http://smaug.fort.gisi.network/", "https://evil.com/", "https://gisi.network.evil.com/", "https://evilgisi.network/", "https://u:p@a.gisi.network/", "https://a.gisi.network:8443/", "javascript:alert(1)", "https:a.gisi.network", "https://" + strings.Repeat("a", 520) + ".gisi.network/"} {
+		if tapURL(bad) {
+			t.Fatalf("%s accepted", bad)
+		}
+	}
+	s, _ := configuredService(t, "https://127.0.0.1:1")
+	if _, err := s.Handle(context.Background(), "push.send", map[string]any{"body": "hi", "url": "https://evil.com/"}); err == nil {
+		t.Fatal("bad url accepted by push.send")
 	}
 }
 
