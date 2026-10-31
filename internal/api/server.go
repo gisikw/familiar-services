@@ -168,7 +168,7 @@ func (s *Server) connection(conn net.Conn) {
 			continue
 		}
 		_ = c.send(response{OK: true, Result: v})
-		if r.Op == "schedule.enqueue" || r.Op == "notify" || r.Op == "schedule.ack" || r.Op == "dnd.set" {
+		if r.Op == "schedule.enqueue" || r.Op == "notify" || r.Op == "schedule.ack" || r.Op == "dnd.set" || r.Op == "inbox.deliver" {
 			s.signal()
 		}
 	}
@@ -347,6 +347,28 @@ func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 			duration = &x
 		}
 		return s.services.Scheduler.DNDSetMode(target, enabled, setBy, mode, duration)
+	case "inbox.list":
+		target, _ := r.Args["target"].(string)
+		if all, _ := r.Args["all"].(bool); all {
+			target = "*"
+		}
+		if target == "" {
+			target = requestTarget(r.Args, connectedTarget, s.defaultTarget())
+		}
+		return s.services.Scheduler.InboxList(target)
+	case "inbox.claim", "inbox.deliver":
+		ref, _ := r.Args["ref"].(string)
+		var v any
+		var err error
+		if r.Op == "inbox.claim" {
+			v, err = s.services.Scheduler.InboxClaim(ref)
+		} else {
+			v, err = s.services.Scheduler.InboxDeliver(ref)
+		}
+		if scheduler.IsNotFound(err) {
+			return nil, &attention.CodedError{Code: "not_found", Err: err}
+		}
+		return v, err
 	default:
 		return nil, &attention.CodedError{Code: "invalid_request", Err: errors.New("unknown operation")}
 	}

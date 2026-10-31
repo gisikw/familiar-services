@@ -115,7 +115,12 @@ func Open(stateDir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, now: time.Now}, nil
+	st := &Store{db: db, now: time.Now}
+	if err = st.initInbox(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return st, nil
 }
 func (s *Store) Close() error { return s.db.Close() }
 
@@ -426,7 +431,7 @@ func (s *Store) ClaimNext(target string, now int64, softOnly bool) (*Event, erro
 	}
 	defer tx.Rollback()
 	query := `SELECT ` + eventColumns + ` FROM events WHERE target=? AND state='pending' AND due_at<=?`
-	if dnd != nil && dnd.Mode != DNDDisturb {
+	if dnd != nil && dnd.Mode == DNDQuiet {
 		// DND holds interruptions. Soft notes ride the next user turn, and a
 		// scheduled fork runs in the background without a turn in the target,
 		// so neither interrupts; its merge is what DND governs.
@@ -453,6 +458,13 @@ func (s *Store) ClaimNext(target string, now int64, softOnly bool) (*Event, erro
 		// a turn instead of sitting until Kev next speaks. Stored, so a
 		// redelivery after a reconnect is a wake too.
 		e.Urgency = "wake"
+	}
+	if dnd != nil && dnd.Mode == DNDSoft && e.Type == "merge" {
+		// Soft Disturb: a tasked return arrives as a stub and the full return
+		// waits in the inbox. Stored, so a redelivery is the stub too.
+		if _, err = stubMerge(tx, &e, now); err != nil {
+			return nil, err
+		}
 	}
 	if _, err = tx.Exec(`UPDATE events SET state='delivered', urgency=? WHERE id=? AND state='pending'`, e.Urgency, e.ID); err != nil {
 		return nil, err
@@ -517,8 +529,8 @@ func (s *Store) DNDSetMode(target string, enabled bool, setBy, mode string, dura
 	if mode == "" {
 		mode = DNDQuiet
 	}
-	if mode != DNDQuiet && mode != DNDDisturb {
-		return nil, errors.New("mode must be quiet or disturb")
+	if mode != DNDQuiet && mode != DNDDisturb && mode != DNDSoft {
+		return nil, errors.New("mode must be quiet, disturb or soft")
 	}
 	target = NormalizeTarget(target)
 	if !ValidTarget(target) || strings.HasPrefix(target, "spawn:") {
@@ -542,7 +554,7 @@ func (s *Store) DNDSetMode(target string, enabled bool, setBy, mode string, dura
 		return nil, errors.New("duration_ms must be positive")
 	}
 	limit := int64(2 * 60 * 60 * 1000)
-	if mode == DNDDisturb {
+	if mode == DNDDisturb || mode == DNDSoft {
 		limit = 24 * 60 * 60 * 1000
 	}
 	if setBy == "familiar" && dur > limit {
