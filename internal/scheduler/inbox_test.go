@@ -35,8 +35,9 @@ func TestSoftStubsTaskedReturnsAndKeepsThemUnclaimed(t *testing.T) {
 	if err != nil || e == nil {
 		t.Fatalf("claim: %v %v", e, err)
 	}
-	// Loud stays loud: the fork asked to wake, so the stub wakes.
-	if e.Urgency != "wake" {
+	// Even a loud return's stub rides the next turn: under Soft it never
+	// starts one (Nov 2: woken stubs cut off audio playout).
+	if e.Urgency != "soft" {
 		t.Fatalf("stub urgency %q", e.Urgency)
 	}
 	var stub map[string]any

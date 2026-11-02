@@ -461,9 +461,16 @@ func (s *Store) ClaimNext(target string, now int64, softOnly bool) (*Event, erro
 	}
 	if dnd != nil && dnd.Mode == DNDSoft && e.Type == "merge" {
 		// Soft Disturb: a tasked return arrives as a stub and the full return
-		// waits in the inbox. Stored, so a redelivery is the stub too.
-		if _, err = stubMerge(tx, &e, now); err != nil {
-			return nil, err
+		// waits in the inbox. Stored, so a redelivery is the stub too. The
+		// stub never starts a turn, whatever the fork asked: it rides the next
+		// natural turn (Nov 2: a woken stub cut off Kes's audio mid-sentence).
+		// A pulled return isn't stubbed, so it still wakes.
+		stubbed, serr := stubMerge(tx, &e, now)
+		if serr != nil {
+			return nil, serr
+		}
+		if stubbed {
+			e.Urgency = "soft"
 		}
 	}
 	if _, err = tx.Exec(`UPDATE events SET state='delivered', urgency=? WHERE id=? AND state='pending'`, e.Urgency, e.ID); err != nil {
