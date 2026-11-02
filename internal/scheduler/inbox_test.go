@@ -143,3 +143,14 @@ func TestSoftModeCappedLikeDisturb(t *testing.T) {
 		t.Fatalf("wake held under soft: %#v", e)
 	}
 }
+
+func TestHeadlineKeepsForksOwnLineWhole(t *testing.T) {
+	long := strings.Repeat("x", 155) // imp merge allows up to 160
+	if got := headlineOf(mergeFacts{Headline: long}); got != long {
+		t.Fatalf("fork headline clipped: %d runes", len([]rune(got)))
+	}
+	fallback := headlineOf(mergeFacts{Summary: strings.Repeat("y", 200) + "\nrest"})
+	if r := []rune(fallback); len(r) != 140 || r[139] != '…' {
+		t.Fatalf("fallback not cut at 140: %q", fallback)
+	}
+}

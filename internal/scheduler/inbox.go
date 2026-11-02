@@ -49,7 +49,43 @@ func (s *Store) initInbox() error {
 		id TEXT PRIMARY KEY, target TEXT NOT NULL, fork TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',
 		status TEXT NOT NULL, headline TEXT NOT NULL, body TEXT NOT NULL,
 		created_at INTEGER NOT NULL, claimed_at INTEGER NOT NULL DEFAULT 0)`)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.reheadInbox()
+}
+
+// reheadInbox re-derives clipped headlines on unclaimed rows from their
+// stored merge body. Headlines used to be cut at 140 runes even though imp
+// merge allows 160, so a fork's own line could arrive with a stray "…".
+func (s *Store) reheadInbox() error {
+	rows, err := s.db.Query(`SELECT id, headline, body FROM inbox WHERE claimed_at=0 AND headline LIKE '%…'`)
+	if err != nil {
+		return err
+	}
+	type fix struct{ id, h string }
+	var fixes []fix
+	for rows.Next() {
+		var id, h, body string
+		if err := rows.Scan(&id, &h, &body); err != nil {
+			rows.Close()
+			return err
+		}
+		var m mergeFacts
+		if json.Unmarshal([]byte(body), &m) != nil {
+			continue
+		}
+		if nh := headlineOf(m); nh != h {
+			fixes = append(fixes, fix{id, nh})
+		}
+	}
+	rows.Close()
+	for _, f := range fixes {
+		if _, err := s.db.Exec(`UPDATE inbox SET headline=? WHERE id=?`, f.h, f.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type mergeFacts struct {
@@ -63,14 +99,16 @@ type mergeFacts struct {
 	Claimed       bool   `json:"claimed"`
 }
 
-// Headline is the fork's own line, or the first line of its return cut short.
+// Headline is the fork's own line, kept whole (imp merge already caps it at
+// 160 runes; 400 is only a backstop), or, for older forks with no headline,
+// the first line of the return cut short at 140.
 func headlineOf(m mergeFacts) string {
-	h := strings.TrimSpace(m.Headline)
+	h, limit := strings.TrimSpace(m.Headline), 400
 	if h == "" {
-		h = strings.TrimSpace(strings.SplitN(strings.TrimSpace(m.Summary), "\n", 2)[0])
+		h, limit = strings.TrimSpace(strings.SplitN(strings.TrimSpace(m.Summary), "\n", 2)[0]), 140
 	}
-	if r := []rune(h); len(r) > 140 {
-		h = string(r[:139]) + "…"
+	if r := []rune(h); len(r) > limit {
+		h = string(r[:limit-1]) + "…"
 	}
 	return h
 }
