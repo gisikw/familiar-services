@@ -248,6 +248,10 @@ func (s *Store) InboxClaim(ref string) (InboxItem, error) {
 	return x, nil
 }
 
+// sourceInboxDeliver marks a return Kev tapped in Open. ClaimNext puts it
+// first, past wake spacing and DND, and always delivers it as a wake.
+const sourceInboxDeliver = "inbox.deliver"
+
 // InboxDeliver claims a return and sends it in full to its target as a wake:
 // Kev tapped it in Open. While that delivery is in flight the merge shows as
 // undelivered (settled), so the row stays until Kes has it.
@@ -267,6 +271,6 @@ func (s *Store) InboxDeliver(ref string) (Event, error) {
 	if strings.TrimSpace(summary) == "" {
 		summary = x.Headline
 	}
-	e, _, err := s.Enqueue(Enqueue{ID: x.ID + "-pulled", Target: x.Target, Origin: x.Fork, Source: "inbox.deliver", Type: "merge", Summary: summary, Body: string(b)})
+	e, _, err := s.Enqueue(Enqueue{ID: x.ID + "-pulled", Target: x.Target, Origin: x.Fork, Source: sourceInboxDeliver, Type: "merge", Urgency: "wake", Summary: summary, Body: string(b)})
 	return e, err
 }

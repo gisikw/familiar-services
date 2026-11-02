@@ -434,8 +434,9 @@ func (s *Store) ClaimNext(target string, now int64, softOnly bool) (*Event, erro
 	if dnd != nil && dnd.Mode == DNDQuiet {
 		// DND holds interruptions. Soft notes ride the next user turn, and a
 		// scheduled fork runs in the background without a turn in the target,
-		// so neither interrupts; its merge is what DND governs.
-		query += ` AND (urgency='soft' OR type='fork')`
+		// so neither interrupts; its merge is what DND governs. A return Kev
+		// tapped in Open is his own request, so DND doesn't hold it.
+		query += ` AND (urgency='soft' OR type='fork' OR source='` + sourceInboxDeliver + `')`
 	}
 	disturb := dnd != nil && dnd.Mode == DNDDisturb
 	// wakes: 1 if this row would start a turn in the target.
@@ -443,10 +444,14 @@ func (s *Store) ClaimNext(target string, now int64, softOnly bool) (*Event, erro
 	if disturb {
 		wakes = `(urgency!='soft' OR type='merge')`
 	}
+	// kevAsked: 1 for a return Kev tapped in Open. He is waiting on it, so it
+	// goes first and isn't held by wake spacing (Nov 2: a tap sat ~4 min
+	// behind other wakes and redeliveries).
+	kevAsked := `(source='` + sourceInboxDeliver + `')`
 	if softOnly {
-		query += ` AND NOT ` + wakes
+		query += ` AND (NOT ` + wakes + ` OR ` + kevAsked + `)`
 	}
-	e, err := scanEvent(tx.QueryRow(query+` ORDER BY `+wakes+` DESC,priority,due_at,created_at LIMIT 1`, target, now))
+	e, err := scanEvent(tx.QueryRow(query+` ORDER BY `+kevAsked+` DESC,`+wakes+` DESC,priority,due_at,created_at LIMIT 1`, target, now))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -459,7 +464,11 @@ func (s *Store) ClaimNext(target string, now int64, softOnly bool) (*Event, erro
 		// redelivery after a reconnect is a wake too.
 		e.Urgency = "wake"
 	}
-	if dnd != nil && dnd.Mode == DNDSoft && e.Type == "merge" {
+	if e.Source == sourceInboxDeliver {
+		// Kev asked for this return now: it always starts a turn, in every
+		// mode, and is never stubbed (it is already claimed).
+		e.Urgency = "wake"
+	} else if dnd != nil && dnd.Mode == DNDSoft && e.Type == "merge" {
 		// Soft Disturb: a tasked return arrives as a stub and the full return
 		// waits in the inbox. Stored, so a redelivery is the stub too. The
 		// stub never starts a turn, whatever the fork asked: it rides the next

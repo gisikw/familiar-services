@@ -130,6 +130,34 @@ func TestInboxDeliverSendsFullReturnAsWake(t *testing.T) {
 	}
 }
 
+func TestKevTappedReturnGoesFirstPastSpacingAndDND(t *testing.T) {
+	for _, mode := range []string{DNDSoft, DNDQuiet} {
+		t.Run(mode, func(t *testing.T) {
+			s := openTest(t)
+			softOn(t, s, "instance:p")
+			_, _, _ = s.Enqueue(Enqueue{ID: "m", Target: "instance:p", Type: "merge", Summary: "x", Body: inboxMergeBody("fork-k", "the whole story", nil)})
+			stub, _ := s.Claim("instance:p", time.Now().UnixMilli())
+			_, _ = s.Ack(stub.ID, "instance:p")
+			d := int64(time.Hour / time.Millisecond)
+			if _, err := s.DNDSetMode("instance:p", true, "user", mode, &d); err != nil {
+				t.Fatal(err)
+			}
+			// Older wakes already waiting (e.g. redelivered scheduled forks).
+			for _, id := range []string{"old-1", "old-2"} {
+				_, _, _ = s.Enqueue(Enqueue{ID: id, Target: "instance:p", DueAt: 1, Summary: id})
+			}
+			if _, err := s.InboxDeliver("fork-k"); err != nil {
+				t.Fatal(err)
+			}
+			// softOnly is what the server uses while spacing wakes 15s apart.
+			got, err := s.ClaimNext("instance:p", time.Now().UnixMilli(), true)
+			if err != nil || got == nil || got.ID != "m-pulled" || got.Urgency != "wake" {
+				t.Fatalf("tapped return: %#v %v", got, err)
+			}
+		})
+	}
+}
+
 func TestSoftModeCappedLikeDisturb(t *testing.T) {
 	s := openTest(t)
 	d := int64(48 * time.Hour / time.Millisecond)
