@@ -364,6 +364,16 @@ func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 			v, err = s.services.Scheduler.InboxClaim(ref)
 		} else {
 			v, err = s.services.Scheduler.InboxDeliver(ref)
+			if scheduler.IsNotFound(err) {
+				// Not in the inbox: a quiet return waiting for Kes's next
+				// turn ("merged · waiting to reach Kes"). Kev tapped it, so
+				// it wakes now.
+				if n, werr := s.services.Scheduler.WakeHeldMerges("", ref, true); werr != nil {
+					return nil, werr
+				} else if n > 0 {
+					return map[string]any{"woke": n}, nil
+				}
+			}
 		}
 		if scheduler.IsNotFound(err) {
 			return nil, &attention.CodedError{Code: "not_found", Err: err}

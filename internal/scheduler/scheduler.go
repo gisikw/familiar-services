@@ -579,6 +579,13 @@ func (s *Store) DNDSetMode(target string, enabled bool, setBy, mode string, dura
 	now := s.now().UnixMilli()
 	d := &DND{Enabled: true, Mode: mode, SetBy: setBy, SetAt: now, ExpiresAt: now + dur}
 	_, err := s.db.Exec(`INSERT INTO dnd(target,set_by,set_at,expires_at,mode) VALUES(?,?,?,?,?) ON CONFLICT(target) DO UPDATE SET set_by=excluded.set_by,set_at=excluded.set_at,expires_at=excluded.expires_at,mode=excluded.mode`, target, setBy, d.SetAt, d.ExpiresAt, mode)
+	if err == nil && mode == DNDDisturb {
+		// Do Disturb means quiet returns wake. Ones already waiting for the
+		// next turn wake now too, instead of sitting until Kev types.
+		if _, werr := s.WakeHeldMerges(target, "", false); werr != nil {
+			log.Printf("scheduler: do disturb: waking held merges for %s: %v", target, werr)
+		}
+	}
 	return d, err
 }
 

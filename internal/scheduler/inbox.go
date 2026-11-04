@@ -274,3 +274,70 @@ func (s *Store) InboxDeliver(ref string) (Event, error) {
 	e, _, err := s.Enqueue(Enqueue{ID: x.ID + "-pulled", Target: x.Target, Origin: x.Fork, Source: sourceInboxDeliver, Type: "merge", Urgency: "wake", Summary: summary, Body: string(b)})
 	return e, err
 }
+
+// WakeHeldMerges turns quiet fork returns that are waiting for the target's
+// next turn into wakes and queues them again, so they start a turn now.
+// A quiet merge is delivered soft: the Pi holds it until Kev next speaks, and
+// it stays unacked ("merged · waiting to reach Kes" in Open) until then.
+// Requeued under the same id, the Pi swaps its held copy for the wake.
+//
+// fork "" takes every held merge for target (Do Disturb switched on: Nov 4,
+// two returns queued before the switch sat until Kev typed). A fork id takes
+// that fork's (Kev tapped it in Open); byKev marks it his, so it goes first
+// and DND doesn't hold it, like a tapped Soft Disturb return. Stubs are left
+// alone: their full return is in the inbox, and InboxDeliver brings that.
+func (s *Store) WakeHeldMerges(target, fork string, byKev bool) (int, error) {
+	q := `SELECT ` + eventColumns + ` FROM events WHERE type='merge' AND urgency='soft' AND state IN ('pending','delivered')`
+	args := []any{}
+	if target != "" {
+		q += ` AND target=?`
+		args = append(args, NormalizeTarget(target))
+	}
+	if fork != "" {
+		q += ` AND origin=?`
+		args = append(args, strings.TrimPrefix(strings.TrimSpace(fork), "instance:"))
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(q, args...)
+	if err != nil {
+		return 0, err
+	}
+	var held []Event
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			rows.Close()
+			return 0, err
+		}
+		held = append(held, e)
+	}
+	rows.Close()
+	n := 0
+	for _, e := range held {
+		var raw map[string]any
+		if json.Unmarshal([]byte(e.Body), &raw) == nil {
+			if stub, _ := raw["stub"].(bool); stub {
+				continue
+			}
+		}
+		source := e.Source
+		if byKev {
+			source = sourceInboxDeliver
+			if raw != nil {
+				raw["pulledBy"] = "kevin"
+				if b, err := json.Marshal(raw); err == nil {
+					e.Body = string(b)
+				}
+			}
+		}
+		if _, err := tx.Exec(`UPDATE events SET state='pending', urgency='wake', source=?, body=? WHERE id=?`, source, e.Body, e.ID); err != nil {
+			return 0, err
+		}
+		n++
+	}
+	return n, tx.Commit()
+}
