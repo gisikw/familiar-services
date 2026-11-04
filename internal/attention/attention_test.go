@@ -65,6 +65,49 @@ func TestJotDoneAndClear(t *testing.T) {
 	}
 }
 
+func TestJotListFlagsSummary(t *testing.T) {
+	s, e := Open(filepath.Join(t.TempDir(), "a.sqlite"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	want := map[string]bool{}
+	for title, summary := range map[string]string{"with": "**Call** [(608) 555-0100](tel:+16085550100)", "none": ""} {
+		j, e := s.Handle("jot.add", map[string]any{"title": title, "due": "2000-01-01"})
+		if e != nil {
+			t.Fatal(e)
+		}
+		id := j.(map[string]any)["id"].(string)
+		if summary != "" {
+			if _, e = s.Handle("card.set", map[string]any{"id": id, "summary": summary}); e != nil {
+				t.Fatal(e)
+			}
+		}
+		want[id] = title == "with"
+	}
+	x, e := s.Handle("jot.list", map[string]any{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	raw, _ := json.Marshal(x)
+	var rows []map[string]any
+	if json.Unmarshal(raw, &rows) != nil {
+		var page struct {
+			Items []map[string]any `json:"items"`
+		}
+		_ = json.Unmarshal(raw, &page)
+		rows = page.Items
+	}
+	if len(rows) != 2 {
+		t.Fatalf("jots: %s", raw)
+	}
+	for _, r := range rows {
+		if r["has_summary"] != want[r["id"].(string)] {
+			t.Fatalf("%v has_summary=%v want %v", r["title"], r["has_summary"], want[r["id"].(string)])
+		}
+	}
+}
+
 func TestCardPrefixResolution(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "a.sqlite"))
 	if err != nil {
