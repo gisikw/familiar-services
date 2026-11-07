@@ -264,6 +264,18 @@ func (s *Store) askAdd(a map[string]any) (any, error) {
 	if !ok || (steps != nil && !validUnits(*steps, 4096, false)) {
 		return nil, code("invalid_request", "steps must be prose of at most 4096 characters")
 	}
+	// context: what the thing is and where it stands ("What this is"),
+	// distinct from steps ("What I need from you", only for real actions).
+	ctxText, ok := optstr(a, "context")
+	if !ok || (ctxText != nil && !validUnits(*ctxText, 2048, false)) {
+		return nil, code("invalid_request", "context must be prose of at most 2048 characters")
+	}
+	// target: the primary this ask's lineage roots in (imp fills it in), for
+	// the built-in "Split this up" fork.
+	target, ok := optstr(a, "target")
+	if !ok || (target != nil && !targetRE.MatchString(*target)) {
+		return nil, code("invalid_request", "target must be instance:<session id>")
+	}
 	link, ok := optstr(a, "link")
 	if !ok || (link != nil && !validLink(*link)) {
 		return nil, code("invalid_request", "link must be an http(s) URL or an absolute path of at most 4096 characters")
@@ -292,7 +304,7 @@ func (s *Store) askAdd(a map[string]any) (any, error) {
 		if !ok || !validKey(key) {
 			return nil, code("invalid_request", "action key must match [a-z0-9-]{1,32}")
 		}
-		if one(key, "not-now", "talk") {
+		if one(key, "not-now", "talk", "split") {
 			return nil, code("invalid_request", "action key "+key+" is reserved")
 		}
 		if keys[key] {
@@ -360,7 +372,7 @@ func (s *Store) askAdd(a map[string]any) (any, error) {
 		if !stage && surfaced < maxSurfaced {
 			state, surfacedAt = "surfaced", at
 		}
-		r, e := tx.Exec("insert into asks(card_id,question,steps,link,link_label,actions,state,position,created_at,surfaced_at) values(?,?,?,?,?,?,?,?,?,?)", card, question, steps, link, label, string(body), state, position, at, surfacedAt)
+		r, e := tx.Exec("insert into asks(card_id,question,steps,context,target,link,link_label,actions,state,position,created_at,surfaced_at) values(?,?,?,?,?,?,?,?,?,?,?,?)", card, question, steps, ctxText, target, link, label, string(body), state, position, at, surfacedAt)
 		if e != nil {
 			return nil, e
 		}
@@ -399,12 +411,12 @@ func addNote(tx *sql.Tx, card, by, at, prefix, question, suffix string) error {
 	return e
 }
 
-const askCols = "a.id,a.card_id,c.project,c.title,a.question,a.steps,a.link,a.link_label,a.actions,a.state,a.created_at,a.surfaced_at,a.resolved_at,a.resolution"
+const askCols = "a.id,a.card_id,c.project,c.title,a.question,a.steps,a.context,a.target,a.link,a.link_label,a.actions,a.state,a.created_at,a.surfaced_at,a.resolved_at,a.resolution"
 
 type askRow struct {
 	ID                             int64
 	Card, Project, Title, Question string
-	Steps, Link, Label             sql.NullString
+	Steps, Context, Target, Link, Label sql.NullString
 	Actions                        []askAction
 	State, Created                 string
 	Surfaced, Resolved, Resolution sql.NullString
@@ -413,7 +425,7 @@ type askRow struct {
 func scanAsk(sc interface{ Scan(...any) error }) (askRow, error) {
 	var r askRow
 	var actions string
-	e := sc.Scan(&r.ID, &r.Card, &r.Project, &r.Title, &r.Question, &r.Steps, &r.Link, &r.Label, &actions, &r.State, &r.Created, &r.Surfaced, &r.Resolved, &r.Resolution)
+	e := sc.Scan(&r.ID, &r.Card, &r.Project, &r.Title, &r.Question, &r.Steps, &r.Context, &r.Target, &r.Link, &r.Label, &actions, &r.State, &r.Created, &r.Surfaced, &r.Resolved, &r.Resolution)
 	if e == nil {
 		e = json.Unmarshal([]byte(actions), &r.Actions)
 	}
@@ -436,7 +448,11 @@ func (r askRow) wire() map[string]any {
 		}
 		actions = append(actions, act)
 	}
-	return map[string]any{"id": r.ID, "card": map[string]any{"id": r.Card, "project": r.Project, "title": r.Title}, "question": r.Question, "steps": n(r.Steps), "link": n(r.Link), "link_label": n(r.Label), "actions": actions, "state": r.State, "created_at": r.Created, "surfaced_at": n(r.Surfaced), "resolved_at": n(r.Resolved), "resolution": n(r.Resolution)}
+	if r.bulk() && one(r.State, "staged", "surfaced") {
+		// Built in on every bundled ask: never stuck between all and nothing.
+		actions = append(actions, map[string]any{"key": SplitKey, "label": "Split this up", "done": "Splitting it up", "fork": true})
+	}
+	return map[string]any{"id": r.ID, "card": map[string]any{"id": r.Card, "project": r.Project, "title": r.Title}, "question": r.Question, "steps": n(r.Steps), "context": n(r.Context), "link": n(r.Link), "link_label": n(r.Label), "actions": actions, "state": r.State, "created_at": r.Created, "surfaced_at": n(r.Surfaced), "resolved_at": n(r.Resolved), "resolution": n(r.Resolution)}
 }
 
 type querier interface {
@@ -539,6 +555,35 @@ func (s *Store) askResolve(actor string, a map[string]any) (any, error) {
 		if choice == "not-now" {
 			if e = resolve(); e == nil {
 				e = addNote(tx, r.Card, actor, at, "Kev: not now on “", r.Question, "” (wrong moment — not a judgment on the ask)")
+			}
+			return r, e
+		}
+		if choice == SplitKey && r.bulk() {
+			if s.SpawnFork == nil {
+				return nil, code("unavailable", "starting a fork is unavailable here")
+			}
+			target := r.Target.String
+			for _, act := range r.Actions {
+				if target == "" && act.Fork != nil && act.Fork.Target != "" {
+					target = act.Fork.Target
+				}
+			}
+			if target == "" {
+				target = s.SplitTarget
+			}
+			if target == "" {
+				target = latestAskTarget(tx)
+			}
+			if target == "" {
+				return nil, code("unavailable", "no instance to start the split fork from")
+			}
+			label := fmt.Sprintf("split ask #%d", r.ID)
+			if e = s.SpawnFork(ForkSpawn{ID: askForkID(r) + "-split", Target: target, Task: r.splitTask(), Label: label, Fresh: true, Ask: r.ID, Choice: SplitKey}); e != nil {
+				return nil, e
+			}
+			forked = true
+			if e = resolve(); e == nil {
+				e = addNote(tx, r.Card, actor, at, "Kev asked to split this up (one ask per card): ", r.Question, "")
 			}
 			return r, e
 		}
@@ -815,4 +860,103 @@ func askForkID(r askRow) string {
 		return -1
 	}, r.Created)
 	return fmt.Sprintf("ask-%d-%s", r.ID, stamp)
+}
+
+// SplitKey is the built-in action on a bundled ask: drop it and have a fork
+// re-stage one ask per card, so Kev is never stuck between all and nothing.
+const SplitKey = "split"
+
+var cardRefRE = regexp.MustCompile(`card:(?:[A-Za-z0-9_-]+/)?([0-9a-fA-F][0-9a-fA-F-]{7,})`)
+
+// askCards is every card an ask touches or names: its own card, each op's
+// card, and every card:… link in its question, context and steps. Keyed by
+// the first 8 characters, the shortest prefix the CLI accepts.
+func (r askRow) askCards() []string {
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if len(id) < 8 {
+			return
+		}
+		k := strings.ToLower(id[:8])
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, id)
+		}
+	}
+	add(r.Card)
+	for _, act := range r.Actions {
+		for _, op := range act.Ops {
+			if id, ok := op["id"].(string); ok {
+				add(id)
+			}
+			if id, ok := op["card"].(string); ok {
+				add(id)
+			}
+		}
+	}
+	for _, text := range []string{r.Question, r.Steps.String, r.Context.String} {
+		for _, m := range cardRefRE.FindAllStringSubmatch(text, -1) {
+			add(m[1])
+		}
+	}
+	return out
+}
+
+// bulk: the ask's decision covers more than one card.
+func (r askRow) bulk() bool { return len(r.askCards()) > 1 }
+
+func (r askRow) splitTask() string {
+	acts, _ := json.MarshalIndent(r.Actions, "", " ")
+	var b strings.Builder
+	fmt.Fprintf(&b, "Kev clicked \"Split this up\" on Attention ask #%d, which bundled several cards into one decision. That ask is already resolved (resolution \"split\"); don't re-add it.\n\n", r.ID)
+	b.WriteString("Read /var/lib/kestrel/skills/asks/SKILL.md first and follow it. Then stage ONE ask per card below (imp attn ask add --json-in --stage), each with:\n")
+	b.WriteString("- a question about that card alone, its noun phrase linked to the card;\n- a `context` (\"What this is\"): 2-4 plain sentences on what the card is and where it stands, checked against reality now (git, live state, the card's notes), not copied from the bundle;\n- `steps` only if Kev must go do something;\n- the same kind of choices the bundle offered, with ops touching only that card.\n")
+	b.WriteString("Skip a card that is already archived. Don't surface more than the 3-slot rule allows; staging is fine. Note on the bundle's own card that it was split, then imp merge --quiet with a count.\n\n")
+	fmt.Fprintf(&b, "Bundled ask #%d on card %s (%s): %s\n", r.ID, r.Card, r.Project, r.Question)
+	if r.Context.Valid {
+		fmt.Fprintf(&b, "\nIts context:\n%s\n", r.Context.String)
+	}
+	if r.Steps.Valid {
+		fmt.Fprintf(&b, "\nIts detail:\n%s\n", r.Steps.String)
+	}
+	fmt.Fprintf(&b, "\nCards it covers:\n- %s\n", strings.Join(r.askCards(), "\n- "))
+	fmt.Fprintf(&b, "\nIts actions (with ops):\n%s\n", acts)
+	task := b.String()
+	if units(task) > 7900 {
+		rs := []rune(task)
+		for units(string(rs)) > 7880 {
+			rs = rs[:len(rs)-200]
+		}
+		task = string(rs) + "\n…(truncated)"
+	}
+	return task
+}
+
+// latestAskTarget is the newest primary any ask recorded (its own target, or
+// a one-click fork's), for bundled asks written before asks carried one.
+func latestAskTarget(tx *sql.Tx) string {
+	var t sql.NullString
+	if tx.QueryRow("select target from asks where target is not null order by id desc limit 1").Scan(&t) == nil && t.Valid && targetRE.MatchString(t.String) {
+		return t.String
+	}
+	rows, e := tx.Query("select actions from asks where actions like '%\"target\":\"instance:%' order by id desc limit 20")
+	if e != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		var acts []askAction
+		if rows.Scan(&raw) != nil || json.Unmarshal([]byte(raw), &acts) != nil {
+			continue
+		}
+		for _, a := range acts {
+			if a.Fork != nil && targetRE.MatchString(a.Fork.Target) {
+				return a.Fork.Target
+			}
+		}
+	}
+	return ""
 }

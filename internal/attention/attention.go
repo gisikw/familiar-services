@@ -39,6 +39,9 @@ type Store struct {
 	// SpawnFork starts a fork when Kev picks an ask action that carries one
 	// (the server wires it to the scheduler). Nil: such a pick is refused.
 	SpawnFork func(ForkSpawn) error
+	// SplitTarget is the instance a "Split this up" fork starts from when the
+	// bundled ask carries no fork target of its own (the primary).
+	SplitTarget string
 }
 
 // DefaultTZ is the local zone for jot dates when FAMILIAR_TZ is unset.
@@ -135,9 +138,11 @@ func open(path string, now func() time.Time, tz *time.Location) (*Store, error) 
 			return nil, e
 		}
 	}
-	if e = addColumn(db, "asks", "undo", "text"); e != nil {
-		db.Close()
-		return nil, e
+	for _, col := range []string{"undo", "context", "target"} {
+		if e = addColumn(db, "asks", col, "text"); e != nil {
+			db.Close()
+			return nil, e
+		}
 	}
 	s := &Store{db: db, now: now, tz: tz}
 	tx, e := db.Begin()
@@ -649,7 +654,7 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 		"card.move": {"id", "lane", "hold_until"}, "card.block": {"id", "reason"}, "card.unblock": {"id"}, "card.done": {"id", "done"}, "note.add": {"card", "text", "detail"},
 		"evidence.add": {"card", "kind", "title", "ref", "meta"}, "agent.start": {"card", "name", "model", "host", "harness"}, "agent.set": {"card", "name", "state", "question"},
 		"jot.add": {"title", "owner", "due"}, "jot.list": {"all"}, "jot.clear-done": {}, "status": {},
-		"ask.add": {"card", "question", "steps", "link", "link_label", "actions", "stage"}, "ask.list": {"all"}, "ask.resolve": {"id", "choice"}, "ask.undo": {"id"}, "ask.talk": {"id"}, "ask.more": {}, "ask.drop": {"id"}, "ask.surface": {"id"},
+		"ask.add": {"card", "question", "steps", "context", "target", "link", "link_label", "actions", "stage"}, "ask.list": {"all"}, "ask.resolve": {"id", "choice"}, "ask.undo": {"id"}, "ask.talk": {"id"}, "ask.more": {}, "ask.drop": {"id"}, "ask.surface": {"id"},
 	}
 	if names, ok := fields[op]; !ok || !allowed(a, names...) {
 		return nil, code("invalid_request", "invalid arguments")

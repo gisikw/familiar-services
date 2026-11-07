@@ -57,6 +57,7 @@ func run(args []string) error {
 		}
 		defer sched.Close()
 		attn.SpawnFork = api.AskForkSpawner(sched)
+		attn.SplitTarget = *defaultTarget
 		pushService, err := push.Open(*stateDir)
 		if err != nil {
 			return err

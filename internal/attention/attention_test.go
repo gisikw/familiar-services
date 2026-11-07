@@ -650,7 +650,7 @@ func TestAskResolveRunsOpsAsActor(t *testing.T) {
 		t.Fatalf("ask %#v", x)
 	}
 	b, _ := json.Marshal(x["actions"])
-	if string(b) != `[{"key":"close","label":"Close both","primary":true},{"key":"keep","label":"Keep open"}]` {
+	if string(b) != `[{"key":"close","label":"Close both","primary":true},{"key":"keep","label":"Keep open"},{"done":"Splitting it up","fork":true,"key":"split","label":"Split this up"}]` {
 		t.Fatalf("actions on the wire: %s", b)
 	}
 	// Ops are stored but never sent to clients.
@@ -1013,4 +1013,66 @@ func TestCardListOrderPagingSince(t *testing.T) {
 			t.Fatalf("accepted %v", bad)
 		}
 	}
+}
+
+func TestAskContextRoundTrips(t *testing.T) {
+	f := newAskFixture(t)
+	c := f.card("Auth: option B")
+	ctx := "Option B is the central login on the pair.\n\nBuilt Oct 30; you revised it Oct 29."
+	x := f.do("kes", "ask.add", map[string]any{
+		"card": c, "question": "Approved?", "context": ctx,
+		"actions": []any{map[string]any{"key": "yes", "label": "Yes"}},
+	}).(map[string]any)
+	if x["context"] != ctx || x["steps"] != nil {
+		t.Fatalf("ask %#v", x)
+	}
+	all, _ := json.Marshal(f.do("kevin", "ask.list", map[string]any{}))
+	if !strings.Contains(string(all), "central login on the pair") {
+		t.Fatalf("context missing from list: %s", all)
+	}
+	f.fails("invalid_request", "ask.add", map[string]any{
+		"card": c, "question": "Too long?", "context": strings.Repeat("x", 2049),
+		"actions": []any{map[string]any{"key": "yes", "label": "Yes"}},
+	})
+}
+
+func TestAskSplitThisUp(t *testing.T) {
+	f := newAskFixture(t)
+	a := f.card("Voice card A")
+	b := f.card("Voice card B")
+	var got []ForkSpawn
+	f.s.SpawnFork = func(x ForkSpawn) error { got = append(got, x); return nil }
+	// One card, no links: no split offered.
+	single := f.do("kes", "ask.add", map[string]any{
+		"card": a, "question": "Close it?", "target": "instance:primary-1",
+		"actions": []any{map[string]any{"key": "close", "label": "Close", "ops": []any{map[string]any{"op": "card.move", "id": a, "lane": "archived"}}}},
+	}).(map[string]any)
+	if s, _ := json.Marshal(single["actions"]); strings.Contains(string(s), `"split"`) {
+		t.Fatalf("single-card ask offers split: %s", s)
+	}
+	// Two cards via a card: link in the context: split offered and works.
+	x := f.do("kes", "ask.add", map[string]any{
+		"card": a, "question": "Close both voice cards?", "context": "Also [B](card:p/" + b + ").",
+		"target": "instance:primary-1",
+		"actions": []any{map[string]any{"key": "close", "label": "Close both", "ops": []any{map[string]any{"op": "card.move", "id": a, "lane": "archived"}}}},
+	}).(map[string]any)
+	id := x["id"].(int64)
+	r := f.do("kevin", "ask.resolve", map[string]any{"id": json.Number(fmt.Sprint(id)), "choice": "split"}).(map[string]any)
+	if r["resolved"].(map[string]any)["resolution"] != "split" || len(got) != 1 {
+		t.Fatalf("split resolve %#v forks %#v", r, got)
+	}
+	sp := got[0]
+	if sp.Target != "instance:primary-1" || !sp.Fresh || sp.Choice != "split" || !strings.Contains(sp.Task, b) || !strings.Contains(sp.Task, "one ask per card") && !strings.Contains(sp.Task, "ONE ask per card") {
+		t.Fatalf("split spawn %#v", sp)
+	}
+	// The cards themselves are untouched.
+	var lane string
+	_ = f.s.db.QueryRow("select lane from cards where id=?", a).Scan(&lane)
+	if lane == "archived" {
+		t.Fatal("split archived a card")
+	}
+	// A reserved key can't be authored.
+	f.fails("invalid_request", "ask.add", map[string]any{
+		"card": a, "question": "x?", "actions": []any{map[string]any{"key": "split", "label": "Split"}},
+	})
 }
