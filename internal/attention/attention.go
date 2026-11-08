@@ -732,8 +732,8 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 			var slug, label, p string
 			var repo sql.NullString
 			_ = rs.Scan(&slug, &label, &p, &repo)
-			counts := map[string]any{"captured": 0, "clarified": 0, "inflight": 0, "review": 0, "settling": 0}
-			cr, _ := s.db.Query("select lane,count(*) from cards where project=? and done=0 group by lane", slug)
+			counts := map[string]any{"captured": 0, "clarified": 0, "inflight": 0, "review": 0, "settling": 0, "todo": 0, "queue": 0, "running": 0, "done": 0}
+			cr, _ := s.db.Query("select lane,count(*) from cards where project=? and done=0 and snoozed=0 group by lane", slug)
 			for cr.Next() {
 				var l string
 				var n int
@@ -758,8 +758,8 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 		} else if e != nil {
 			return nil, e
 		}
-		counts := map[string]any{"captured": 0, "clarified": 0, "inflight": 0, "review": 0, "settling": 0}
-		cr, e := s.db.Query("select lane,count(*) from cards where project=? and done=0 group by lane", slug)
+		counts := map[string]any{"captured": 0, "clarified": 0, "inflight": 0, "review": 0, "settling": 0, "todo": 0, "queue": 0, "running": 0, "done": 0}
+		cr, e := s.db.Query("select lane,count(*) from cards where project=? and done=0 and snoozed=0 group by lane", slug)
 		if e != nil {
 			return nil, e
 		}
