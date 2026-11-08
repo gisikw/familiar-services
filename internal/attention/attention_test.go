@@ -441,8 +441,13 @@ func TestJotPromotionViaCardSet(t *testing.T) {
 	if card.(map[string]any)["due"] != nil {
 		t.Fatalf("card due: %#v", card)
 	}
-	if _, err = s.Handle("card.set", map[string]any{"id": card.(map[string]any)["id"], "due": "2026-10-11"}); err == nil {
-		t.Fatal("due on a non-jot accepted")
+	// Boards rethink: any card may carry a due date (it shows in Todo when due);
+	// maybe_on stays a jot thing.
+	if _, err = s.Handle("card.set", map[string]any{"id": card.(map[string]any)["id"], "due": "2026-10-11"}); err != nil {
+		t.Fatalf("due on a card: %v", err)
+	}
+	if _, err = s.Handle("card.set", map[string]any{"id": card.(map[string]any)["id"], "maybe_on": "2026-10-11"}); err == nil {
+		t.Fatal("maybe_on on a non-jot accepted")
 	}
 }
 
@@ -873,14 +878,14 @@ func TestAskForkActionSpawnsOnceAndHasNoUndo(t *testing.T) {
 		t.Fatalf("spawns: %#v", got)
 	}
 	g := got[0]
-	if g.Target != "instance:01abc" || g.Task != "Enable L1 and verify l1 log." || !g.Fresh || g.Label != "Do it" || g.Ask != id || g.Choice != "go" || !strings.HasPrefix(g.ID, fmt.Sprintf("ask-%d-", id)) {
+	if g.Target != "instance:01abc" || g.Task != ForkClickLine("Do it", c, "L1") || !g.Fresh || g.Label != "Do it" || g.Ask != id || g.Choice != "go" || !strings.HasPrefix(g.ID, fmt.Sprintf("ask-%d-", id)) {
 		t.Fatalf("spawn %#v", g)
 	}
 	if lane := f.do("kevin", "card.get", map[string]any{"id": c}).(map[string]any)["lane"]; lane != "inflight" {
 		t.Fatalf("ops didn't run alongside: %v", lane)
 	}
 	notes := strings.Join(f.notes(c), "\n")
-	if !strings.Contains(notes, "Started a fork (Do it) for: Turn on L1?") {
+	if !strings.Contains(notes, "Started a fork (Do it) for: Turn on L1?") || !strings.Contains(notes, "If Kev clicks “Do it”, a fork starts on: Enable L1 and verify l1 log.") {
 		t.Fatalf("notes: %s", notes)
 	}
 	f.fails("conflict", "ask.undo", map[string]any{"id": id})
@@ -1053,7 +1058,7 @@ func TestAskSplitThisUp(t *testing.T) {
 	// Two cards via a card: link in the context: split offered and works.
 	x := f.do("kes", "ask.add", map[string]any{
 		"card": a, "question": "Close both voice cards?", "context": "Also [B](card:p/" + b + ").",
-		"target": "instance:primary-1",
+		"target":  "instance:primary-1",
 		"actions": []any{map[string]any{"key": "close", "label": "Close both", "ops": []any{map[string]any{"op": "card.move", "id": a, "lane": "archived"}}}},
 	}).(map[string]any)
 	id := x["id"].(int64)

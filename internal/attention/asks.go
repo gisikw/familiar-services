@@ -380,12 +380,25 @@ func (s *Store) askAdd(a map[string]any) (any, error) {
 		if e == nil {
 			e = addNote(tx, card, "kes", at, "Asked Kev: ", question, "")
 		}
+		// The card is the brief: every fork an action would start is written on
+		// the card now, where Kev can read it before he clicks. The fork itself
+		// is told only which button he clicked on which card.
+		for _, act := range actions {
+			if e == nil && act.Fork != nil {
+				e = forkBriefNote(tx, card, at, act.Label, act.Fork.Task)
+			}
+		}
 		return id, e
 	})
 	if e != nil {
 		return nil, e
 	}
 	return s.ask(v.(int64))
+}
+
+// forkBriefNote records on the card what clicking a fork action will start.
+func forkBriefNote(tx *sql.Tx, card, at, label, task string) error {
+	return addNote(tx, card, "kes", at, "If Kev clicks “"+label+"”, a fork starts on: ", task, "")
 }
 
 // addNote writes a generated card note (prefix + question + suffix), with
@@ -414,12 +427,12 @@ func addNote(tx *sql.Tx, card, by, at, prefix, question, suffix string) error {
 const askCols = "a.id,a.card_id,c.project,c.title,a.question,a.steps,a.context,a.target,a.link,a.link_label,a.actions,a.state,a.created_at,a.surfaced_at,a.resolved_at,a.resolution"
 
 type askRow struct {
-	ID                             int64
-	Card, Project, Title, Question string
+	ID                                  int64
+	Card, Project, Title, Question      string
 	Steps, Context, Target, Link, Label sql.NullString
-	Actions                        []askAction
-	State, Created                 string
-	Surfaced, Resolved, Resolution sql.NullString
+	Actions                             []askAction
+	State, Created                      string
+	Surfaced, Resolved, Resolution      sql.NullString
 }
 
 func scanAsk(sc interface{ Scan(...any) error }) (askRow, error) {
@@ -625,7 +638,16 @@ func (s *Store) askResolve(actor string, a map[string]any) (any, error) {
 			if label == "" {
 				label = act.Label
 			}
-			if e = s.SpawnFork(ForkSpawn{ID: askForkID(r), Target: f.Target, Task: f.Task, Label: label, Fresh: f.Fresh, Ask: r.ID, Choice: act.Key}); e != nil {
+			var briefed int
+			_ = tx.QueryRow("select count(*) from notes where card_id=? and text like ?", r.Card, "If Kev clicks “"+act.Label+"”, a fork starts on: %").Scan(&briefed)
+			if briefed == 0 {
+				// An ask staged before briefs went on the card: put it there now,
+				// so the fork reads it where Kev can too.
+				if e = forkBriefNote(tx, r.Card, at, act.Label, f.Task); e != nil {
+					return nil, e
+				}
+			}
+			if e = s.SpawnFork(ForkSpawn{ID: askForkID(r), Target: f.Target, Task: ForkClickLine(act.Label, r.Card, r.Title), Label: label, Fresh: f.Fresh, Ask: r.ID, Choice: act.Key}); e != nil {
 				return nil, e
 			}
 			forked = true

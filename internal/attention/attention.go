@@ -144,6 +144,10 @@ func open(path string, now func() time.Time, tz *time.Location) (*Store, error) 
 			return nil, e
 		}
 	}
+	if e = upgradeCardsV3(db); e != nil {
+		db.Close()
+		return nil, e
+	}
 	s := &Store{db: db, now: now, tz: tz}
 	tx, e := db.Begin()
 	if e != nil {
@@ -344,6 +348,9 @@ type cardRow struct {
 	ID, Project, Lane, Title          string
 	Summary, Owner, Policy, Blocked   sql.NullString
 	Hold, Due, MaybeOn                sql.NullString
+	Queue, Revisit, Confidence, Exit  sql.NullString
+	WokeAt, Actions                   sql.NullString
+	Snoozed, Approved                 int
 	Done                              int
 	Captured, Moved, Updated, Default string
 	Hidden                            int
@@ -351,11 +358,11 @@ type cardRow struct {
 
 func scanCard(sc interface{ Scan(...any) error }) (cardRow, error) {
 	var r cardRow
-	e := sc.Scan(&r.ID, &r.Project, &r.Lane, &r.Title, &r.Summary, &r.Owner, &r.Policy, &r.Blocked, &r.Hold, &r.Due, &r.MaybeOn, &r.Done, &r.Captured, &r.Moved, &r.Updated, &r.Default, &r.Hidden)
+	e := sc.Scan(&r.ID, &r.Project, &r.Lane, &r.Title, &r.Summary, &r.Owner, &r.Policy, &r.Blocked, &r.Hold, &r.Due, &r.MaybeOn, &r.Queue, &r.Revisit, &r.Confidence, &r.Exit, &r.WokeAt, &r.Actions, &r.Snoozed, &r.Approved, &r.Done, &r.Captured, &r.Moved, &r.Updated, &r.Default, &r.Hidden)
 	return r, e
 }
 
-const cardCols = "c.id,c.project,c.lane,c.title,c.summary,c.owner,c.policy,c.blocked,c.hold_until,c.due,c.maybe_on,c.done,c.captured_at,c.moved_at,c.updated_at,p.default_policy,p.hidden"
+const cardCols = "c.id,c.project,c.lane,c.title,c.summary,c.owner,c.policy,c.blocked,c.hold_until,c.due,c.maybe_on,c.queue,c.revisit,c.confidence,c.exit,c.woke_at,c.actions,c.snoozed,c.approved,c.done,c.captured_at,c.moved_at,c.updated_at,p.default_policy,p.hidden"
 
 func (s *Store) card(id string) (cardRow, error) {
 	return scanCard(s.db.QueryRow("select "+cardCols+" from cards c join projects p on p.slug=c.project where c.id=?", id))
@@ -403,7 +410,21 @@ func (s *Store) concise(r cardRow) (map[string]any, error) {
 		effective = r.Policy.String
 	}
 	now := s.now().UnixMilli()
-	return map[string]any{"id": r.ID, "project": r.Project, "lane": r.Lane, "title": r.Title, "owner": n(r.Owner), "hold_until": n(r.Hold), "due": n(r.Due), "maybe_on": n(r.MaybeOn), "policy": n(r.Policy), "effective_policy": effective, "diverges": r.Policy.Valid && r.Policy.String != r.Default, "blocked": n(r.Blocked), "edge": edge, "dispatched": r.Lane == "inflight" && running+blocked > 0, "stale": r.Project == "_today" && r.Done == 0 && now-parseMS(r.Captured) > 36*60*60*1000, "fading": r.Lane == "captured" && now-parseMS(r.Captured) > 14*24*60*60*1000, "done": r.Done != 0, "age_s": max64(0, (now-parseMS(r.Captured))/1000), "moved_s": max64(0, (now-parseMS(r.Moved))/1000), "agents": map[string]any{"running": running, "blocked": blocked}, "notes": notes, "evidence": evidence, "has_summary": r.Summary.Valid && strings.TrimSpace(r.Summary.String) != ""}, nil
+	x := map[string]any{"id": r.ID, "project": r.Project, "lane": r.Lane, "title": r.Title, "owner": n(r.Owner), "hold_until": n(r.Hold), "due": n(r.Due), "maybe_on": n(r.MaybeOn), "policy": n(r.Policy), "effective_policy": effective, "diverges": r.Policy.Valid && r.Policy.String != r.Default, "blocked": n(r.Blocked), "edge": edge, "dispatched": r.Lane == "inflight" && running+blocked > 0, "stale": r.Project == "_today" && r.Done == 0 && now-parseMS(r.Captured) > 36*60*60*1000, "fading": r.Lane == "captured" && now-parseMS(r.Captured) > 14*24*60*60*1000, "done": r.Done != 0, "age_s": max64(0, (now-parseMS(r.Captured))/1000), "moved_s": max64(0, (now-parseMS(r.Moved))/1000), "agents": map[string]any{"running": running, "blocked": blocked}, "notes": notes, "evidence": evidence, "has_summary": r.Summary.Valid && strings.TrimSpace(r.Summary.String) != ""}
+	today := s.today()
+	x["queue"] = n(r.Queue)
+	x["revisit"] = n(r.Revisit)
+	x["snoozed"] = r.Snoozed != 0
+	x["confidence"] = n(r.Confidence)
+	x["approved"] = r.Approved != 0
+	x["exit"] = n(r.Exit)
+	x["woke_at"] = n(r.WokeAt)
+	x["side"] = side(r)
+	x["proving"] = r.Lane == "done" && r.Confidence.Valid && one(r.Confidence.String, "low", "medium")
+	x["review"] = r.Lane == "done" && r.Confidence.Valid && one(r.Confidence.String, "medium", "high") && r.Approved == 0
+	x["revisit_due"] = r.Revisit.Valid && r.Revisit.String <= today && r.Snoozed == 0
+	x["actions"] = cardActionsWire(r.Actions)
+	return x, nil
 }
 func max64(a, b int64) int64 {
 	if a > b {
@@ -542,10 +563,16 @@ func timelineText(actor, kind string, d map[string]any, def string) string {
 		if to == "inflight" {
 			return "in flight" + suffix
 		}
+		if to == "queue" && g("queue") != "" {
+			return "queued for Kes: " + g("queue") + suffix
+		}
+		if g("why") != "" {
+			return "moved to " + to + " (" + g("why") + ")" + suffix
+		}
 		return "moved to " + to + suffix
 	case "edited":
 		keys := []string{}
-		for _, k := range []string{"title", "summary", "due", "maybe_on"} {
+		for _, k := range []string{"title", "summary", "due", "maybe_on", "queue", "revisit", "exit", "actions"} {
 			if _, ok := d[k]; ok {
 				keys = append(keys, k)
 			}
@@ -603,6 +630,30 @@ func timelineText(actor, kind string, d map[string]any, def string) string {
 			return "reopened" + suffix
 		}
 		return "done" + suffix
+	case "snoozed":
+		return "snoozed until " + g("until") + suffix
+	case "woke":
+		return "back from Icebox"
+	case "confidence":
+		if g("confidence") == "" {
+			return "confidence cleared" + suffix
+		}
+		return "confidence " + g("confidence") + suffix
+	case "approval":
+		text := "approved"
+		if kept, _ := d["kept"].(bool); kept {
+			text = "approval kept"
+		} else if ok, _ := d["approved"].(bool); !ok {
+			text = "approval reset"
+		}
+		if g("reason") != "" {
+			text += ": " + g("reason")
+		}
+		return text + suffix
+	case "acted":
+		return strings.TrimSpace("clicked “" + g("label") + "”" + suffix)
+	case "forked":
+		return "started a fork (" + g("label") + ")" + suffix
 	}
 	return kind
 }
@@ -650,10 +701,11 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 	}
 	fields := map[string][]string{
 		"project.list": {"hidden"}, "project.get": {"slug"}, "project.add": {"slug", "label", "default_policy", "repo"}, "project.set": {"slug", "label", "default_policy", "repo"},
-		"card.list": {"project", "lane", "owner", "edge", "q", "order", "offset", "limit", "since", "created_since"}, "card.get": {"id"}, "card.add": {"project", "title", "lane", "summary", "owner", "policy"}, "card.set": {"id", "title", "summary", "owner", "policy", "due", "maybe_on"},
-		"card.move": {"id", "lane", "hold_until"}, "card.block": {"id", "reason"}, "card.unblock": {"id"}, "card.done": {"id", "done"}, "note.add": {"card", "text", "detail"},
-		"evidence.add": {"card", "kind", "title", "ref", "meta"}, "agent.start": {"card", "name", "model", "host", "harness"}, "agent.set": {"card", "name", "state", "question"},
-		"jot.add": {"title", "owner", "due"}, "jot.list": {"all"}, "jot.clear-done": {}, "status": {},
+		"card.list": {"project", "lane", "owner", "edge", "q", "order", "offset", "limit", "since", "created_since"}, "card.get": {"id"}, "card.add": {"project", "title", "lane", "summary", "owner", "policy", "queue", "due", "snooze"}, "card.set": {"id", "title", "summary", "owner", "policy", "due", "maybe_on", "queue", "revisit", "confidence", "exit", "approved", "approval_reason", "actions"},
+		"card.move": {"id", "lane", "hold_until", "queue", "confidence", "exit", "revisit"}, "card.snooze": {"id", "until", "for"}, "card.act": {"id", "key", "text"},
+		"card.view": {"view", "project", "queue", "offset", "limit"}, "board.view": {"project", "limit"}, "todo.list": {"offset", "limit"}, "migrate.lanes": {"run", "token"}, "card.block": {"id", "reason"}, "card.unblock": {"id"}, "card.done": {"id", "done"}, "note.add": {"card", "text", "detail"},
+		"evidence.add": {"card", "kind", "title", "ref", "meta", "approval", "approval_reason"}, "agent.start": {"card", "name", "model", "host", "harness"}, "agent.set": {"card", "name", "state", "question"},
+		"jot.add": {"title", "owner", "due", "snooze"}, "jot.list": {"all"}, "jot.clear-done": {}, "status": {},
 		"ask.add": {"card", "question", "steps", "context", "target", "link", "link_label", "actions", "stage"}, "ask.list": {"all"}, "ask.resolve": {"id", "choice"}, "ask.undo": {"id"}, "ask.talk": {"id"}, "ask.more": {}, "ask.drop": {"id"}, "ask.surface": {"id"},
 	}
 	if names, ok := fields[op]; !ok || !allowed(a, names...) {
@@ -733,6 +785,26 @@ func (s *Store) HandleAs(actor, op string, a map[string]any) (any, error) {
 		return s.full(id)
 	case "card.list":
 		return s.cardList(a)
+	case "card.view":
+		return s.cardView(a)
+	case "board.view":
+		return s.boardView(a)
+	case "todo.list":
+		return s.todoList(a)
+	case "migrate.lanes":
+		return s.migrateLanes(actor, a)
+	case "card.act":
+		return s.cardAct(actor, a)
+	case "card.snooze":
+		ref, _ := str(a, "id")
+		id, e := s.resolveCardID(ref)
+		if e != nil {
+			return nil, e
+		}
+		if _, e = s.write(func(tx *sql.Tx, at string) (any, error) { return nil, s.snoozeTx(tx, at, actor, id, a) }); e != nil {
+			return nil, e
+		}
+		return s.full(id)
 	case "jot.list":
 		all, ok := boolean(a, "all", false)
 		if !ok {
@@ -988,17 +1060,44 @@ func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 	}
 	project := "_today"
 	lane := "captured"
+	migrated := s.lanesV3()
+	if migrated {
+		lane = "todo" // capture lands in Todo (boards rethink)
+	}
 	var due, maybe any
-	if jot {
-		x, ok := optstr(a, "due")
-		if !ok || (x != nil && !validDate(*x)) {
-			return nil, code("invalid_request", "due must be YYYY-MM-DD")
+	if x, ok := optstr(a, "due"); !ok || (x != nil && !validDate(*x)) {
+		return nil, code("invalid_request", "due must be YYYY-MM-DD")
+	} else if x != nil {
+		due = *x
+	}
+	if jot && due == nil {
+		maybe = s.today()
+	}
+	var snoozeArgs map[string]any
+	if v, has := a["snooze"]; has {
+		switch x := v.(type) {
+		case bool:
+			if x {
+				snoozeArgs = map[string]any{}
+			}
+		case string:
+			if validDate(x) {
+				snoozeArgs = map[string]any{"until": x}
+			} else if _, ok := parseDur(x); ok {
+				snoozeArgs = map[string]any{"for": x}
+			} else {
+				return nil, code("invalid_request", "snooze is true, a duration (6mo) or a date")
+			}
+		default:
+			return nil, code("invalid_request", "invalid snooze")
 		}
-		if x != nil {
-			due = *x
-		} else {
-			maybe = s.today()
+	}
+	var queue any
+	if x, ok := str(a, "queue"); ok {
+		if !one(x, queues...) {
+			return nil, code("invalid_request", "invalid queue")
 		}
+		queue = x
 	}
 	if owner, exists := a["owner"]; exists {
 		if x, ok := owner.(string); !ok || !one(x, "kevin", "kes") {
@@ -1016,7 +1115,7 @@ func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 		}
 	}
 	if jot {
-		if x, ok := str(a, "owner"); ok && x == "kes" {
+		if x, ok := str(a, "owner"); ok && x == "kes" && !migrated {
 			lane = "clarified"
 		}
 	} else {
@@ -1027,8 +1126,20 @@ func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 		if x, ok := str(a, "lane"); ok {
 			lane = x
 		}
-		if !one(lane, "captured", "icebox", "clarified", "inflight", "review", "settling", "archived") {
+		if !validLane(lane) {
 			return nil, code("invalid_request", "invalid lane")
+		}
+		if queue != nil && lane != "queue" {
+			if _, has := a["lane"]; has {
+				return nil, code("invalid_request", "queue goes with lane queue")
+			}
+			lane = "queue"
+		}
+		if lane == "queue" && queue == nil {
+			return nil, code("invalid_request", "lane queue needs a queue (just-do-it, build-but-wait, help-me-think)")
+		}
+		if lane == "done" {
+			return nil, code("invalid_request", "add the card elsewhere and move it to done with a confidence")
 		}
 		if lane == "settling" {
 			if x, ok := str(a, "owner"); ok && x == "kes" {
@@ -1050,9 +1161,12 @@ func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 			owner = &x
 		}
 		policy, _ := optstr(a, "policy")
-		_, e := tx.Exec("insert into cards(id,project,lane,title,summary,owner,policy,blocked,done,captured_at,moved_at,updated_at,due,maybe_on) values(?,?,?,?,?,?,?,null,0,?,?,?,?,?)", id, project, lane, title, summary, owner, policy, at, at, at, due, maybe)
+		_, e := tx.Exec("insert into cards(id,project,lane,title,summary,owner,policy,blocked,done,captured_at,moved_at,updated_at,due,maybe_on,queue) values(?,?,?,?,?,?,?,null,0,?,?,?,?,?,?)", id, project, lane, title, summary, owner, policy, at, at, at, due, maybe, queue)
 		if e == nil {
 			data := map[string]any{"lane": lane}
+			if queue != nil {
+				data["queue"] = queue
+			}
 			if owner != nil {
 				data["owner"] = *owner
 			}
@@ -1063,6 +1177,9 @@ func (s *Store) cardAdd(actor string, a map[string]any, jot bool) (any, error) {
 				data["due"] = due
 			}
 			e = event(tx, id, actor, "created", at, data)
+		}
+		if e == nil && snoozeArgs != nil {
+			e = s.snoozeTx(tx, at, actor, id, snoozeArgs)
 		}
 		return nil, e
 	})
@@ -1132,8 +1249,8 @@ func (s *Store) apply(tx *sql.Tx, at, actor, op, id string, a map[string]any) (a
 		dv, mv := nullArg(oldDue), nullArg(oldMaybe)
 		_, hasDue := a["due"]
 		_, hasMaybe := a["maybe_on"]
-		if (hasDue || hasMaybe) && project != "_today" {
-			return nil, code("invalid_request", "due and maybe_on apply only to jots")
+		if hasMaybe && project != "_today" {
+			return nil, code("invalid_request", "maybe_on applies only to jots")
 		}
 		if hasMaybe {
 			x, ok := optstr(a, "maybe_on")
@@ -1224,14 +1341,31 @@ func (s *Store) apply(tx *sql.Tx, at, actor, op, id string, a map[string]any) (a
 			er = event(tx, id, actor, "policy", at, map[string]any{"policy": pv, "default": defaultPolicy})
 			changed = true
 		}
+		if er == nil {
+			var c3 bool
+			c3, er = s.setV3(tx, at, actor, id, a)
+			changed = changed || c3
+		}
 		if er == nil && changed {
 			er = touch(false)
 		}
 		return id, er
 	case "card.move":
 		lane, ok := str(a, "lane")
-		if !ok || !one(lane, "captured", "icebox", "clarified", "inflight", "review", "settling", "archived") {
+		if !ok || !validLane(lane) {
 			return nil, code("invalid_request", "invalid lane")
+		}
+		if lane == "icebox" && s.lanesV3() {
+			// After the rethink, Icebox is a snooze: the default, keeping the lane.
+			return id, s.snoozeTx(tx, at, actor, id, map[string]any{})
+		}
+		if one(lane, v3Lanes...) || lane == "archived" && s.lanesV3() {
+			return id, s.moveV3(tx, at, actor, id, lane, a)
+		}
+		for _, k := range []string{"queue", "confidence", "exit", "revisit"} {
+			if _, has := a[k]; has {
+				return nil, code("invalid_request", k+" applies to the new lanes (todo, queue, running, done)")
+			}
 		}
 		hold, ok := optstr(a, "hold_until")
 		if !ok {
@@ -1393,6 +1527,9 @@ func (s *Store) apply(tx *sql.Tx, at, actor, op, id string, a map[string]any) (a
 		_, e := tx.Exec("insert into evidence(card_id,at,kind,title,ref,meta) values(?,?,?,?,?,?)", id, at, kind, title, ref, meta)
 		if e == nil {
 			e = event(tx, id, actor, "evidence", at, map[string]any{"kind": kind, "title": title})
+		}
+		if e == nil {
+			e = s.approvalGate(tx, at, actor, id, kind, a)
 		}
 		if e == nil {
 			e = touch(false)
