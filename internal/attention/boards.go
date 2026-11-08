@@ -255,9 +255,12 @@ func (s *Store) viewRows(view, project, queue string) ([]cardRow, error) {
 	case "archived":
 		w = append(w, "c.lane='archived'")
 	default:
-		if one(view, legacyLanes...) && view != "icebox" {
+		// "legacy:<lane>" reads a raw legacy lane. Bare names still work for
+		// the ones that aren't also v3 views ("review" is both: bare means v3).
+		lane := strings.TrimPrefix(view, "legacy:")
+		if one(lane, legacyLanes...) && lane != "icebox" {
 			w = append(w, "c.lane=?")
-			args = append(args, view)
+			args = append(args, lane)
 			order = "c.moved_at asc"
 			break
 		}
@@ -357,7 +360,7 @@ func (s *Store) boardView(a map[string]any) (any, error) {
 		if l == "icebox" {
 			continue
 		}
-		rows, e := s.viewRows(l, project, "")
+		rows, e := s.viewRows("legacy:"+l, project, "")
 		if e != nil {
 			return nil, e
 		}

@@ -329,6 +329,37 @@ func TestBoardViewColumns(t *testing.T) {
 	}
 }
 
+func TestLegacyReviewIsNotV3Review(t *testing.T) {
+	// "review" names both a legacy lane and the v3 Review projection. A v3
+	// done/medium card must not be reported as an unmigrated legacy card.
+	s, _ := boardStore(t)
+	v3 := h(t, s, "kes", "card.add", map[string]any{"project": "p", "title": "v3"})["id"].(string)
+	old := h(t, s, "kes", "card.add", map[string]any{"project": "p", "title": "old"})["id"].(string)
+	if _, e := s.db.Exec("update cards set lane='done',confidence='medium',approved=0 where id=?", v3); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := s.db.Exec("update cards set lane='review' where id=?", old); e != nil {
+		t.Fatal(e)
+	}
+	cols := h(t, s, "kes", "board.view", map[string]any{"project": "p"})["columns"].(map[string]any)
+	leg := cols["legacy"].(map[string]any)
+	r, ok := leg["review"].(map[string]any)
+	if !ok || r["total"] != 1 || r["items"].([]any)[0].(map[string]any)["id"] != old {
+		t.Fatalf("legacy review: %#v", leg)
+	}
+	if rv := cols["review"].(map[string]any); rv["total"] != 1 || rv["items"].([]any)[0].(map[string]any)["id"] != v3 {
+		t.Fatalf("v3 review: %#v", rv)
+	}
+	// With the legacy card gone, nothing is reported as unmigrated.
+	if _, e := s.db.Exec("update cards set lane='todo' where id=?", old); e != nil {
+		t.Fatal(e)
+	}
+	cols = h(t, s, "kes", "board.view", map[string]any{"project": "p"})["columns"].(map[string]any)
+	if leg := cols["legacy"].(map[string]any); len(leg) != 0 {
+		t.Fatalf("legacy should be empty: %#v", leg)
+	}
+}
+
 func TestLanesMigrationDryRunThenRun(t *testing.T) {
 	s, _ := boardStore(t)
 	kev := h(t, s, "kes", "card.add", map[string]any{"project": "p", "title": "kev's", "owner": "kevin"})["id"].(string)
