@@ -785,7 +785,7 @@ func TestAskAddRejectsInvalid(t *testing.T) {
 		"disallowed op":     base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.add", "project": "p", "title": "t"})}}),
 		"agent op":          base(map[string]any{"actions": []any{ops(map[string]any{"op": "agent.start", "card": c, "name": "x"})}}),
 		"missing lane":      base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.move", "id": c})}}),
-		"bad lane":          base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.move", "id": c, "lane": "done"})}}),
+		"bad lane":          base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.move", "id": c, "lane": "proving"})}}),
 		"hold_until":        base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.move", "id": c, "lane": "settling", "hold_until": "2030-01-01T00:00:00Z"})}}),
 		"missing reason":    base(map[string]any{"actions": []any{ops(map[string]any{"op": "card.block", "id": c})}}),
 		"missing note text": base(map[string]any{"actions": []any{ops(map[string]any{"op": "note.add", "card": c})}}),

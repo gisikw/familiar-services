@@ -25,7 +25,7 @@ const maxSurfaced = 3
 
 // askOp lists, per allowed action op, the accepted and the required fields.
 var askOps = map[string]struct{ fields, required []string }{
-	"card.move":    {[]string{"id", "lane"}, []string{"id", "lane"}},
+	"card.move":    {[]string{"id", "lane", "queue", "confidence", "exit", "revisit"}, []string{"id", "lane"}},
 	"card.set":     {[]string{"id", "owner", "title", "summary"}, []string{"id"}},
 	"card.done":    {[]string{"id", "done"}, []string{"id"}},
 	"card.block":   {[]string{"id", "reason"}, []string{"id", "reason"}},
@@ -210,8 +210,24 @@ func (s *Store) validAskOp(raw any) (map[string]any, error) {
 	args[ref] = id
 	switch name {
 	case "card.move":
-		if lane, ok := str(args, "lane"); !ok || !one(lane, "captured", "icebox", "clarified", "inflight", "review", "settling", "archived") {
+		// Legacy and v3 lanes both; the executor (moveV3) checks queue,
+		// confidence, exit and revisit against the lane when Kev clicks.
+		lane, ok := str(args, "lane")
+		if !ok || !validLane(lane) {
 			return nil, bad("invalid lane")
+		}
+		if q, ok := optstr(args, "queue"); !ok || (q != nil && (lane != "queue" || !one(*q, queues...))) {
+			return nil, bad("queue must be one of " + strings.Join(queues, ", ") + " and goes with lane queue")
+		}
+		if lane == "queue" {
+			if _, has := args["queue"]; !has {
+				return nil, bad("a move to lane queue needs a queue")
+			}
+		}
+		for _, k := range []string{"confidence", "exit", "revisit"} {
+			if _, has := args[k]; has && !one(lane, v3Lanes...) {
+				return nil, bad(k + " applies to the new lanes (todo, queue, running, done)")
+			}
 		}
 	case "card.set":
 		if _, has := args["title"]; has {
@@ -766,6 +782,11 @@ type cardSnap struct {
 	Summary, Owner, Policy, Blocked, Hold, Due, May sql.NullString
 	Done                                            int
 	Moved                                           string
+	// The boards-rethink columns. V3 marks a snapshot that carries them, so an
+	// undo record written before they existed doesn't null them out.
+	V3                                     bool `json:",omitempty"`
+	Queue, Revisit, Confidence, Exit, Woke sql.NullString
+	Snoozed, Approved                      int
 }
 
 type askUndoRec struct {
@@ -774,7 +795,7 @@ type askUndoRec struct {
 	Fork  bool       `json:"fork,omitempty"` // a fork started: not undoable
 }
 
-const snapCols = "id,lane,title,summary,owner,policy,blocked,hold_until,due,maybe_on,done,moved_at"
+const snapCols = "id,lane,title,summary,owner,policy,blocked,hold_until,due,maybe_on,done,moved_at,queue,revisit,confidence,exit,woke_at,snoozed,approved"
 
 func snapCards(tx *sql.Tx, ops []map[string]any) ([]cardSnap, error) {
 	seen := map[string]bool{}
@@ -790,12 +811,13 @@ func snapCards(tx *sql.Tx, ops []map[string]any) ([]cardSnap, error) {
 		}
 		seen[id] = true
 		var c cardSnap
-		if e := tx.QueryRow("select "+snapCols+" from cards where id=?", id).Scan(&c.ID, &c.Lane, &c.Title, &c.Summary, &c.Owner, &c.Policy, &c.Blocked, &c.Hold, &c.Due, &c.May, &c.Done, &c.Moved); e != nil {
+		if e := tx.QueryRow("select "+snapCols+" from cards where id=?", id).Scan(&c.ID, &c.Lane, &c.Title, &c.Summary, &c.Owner, &c.Policy, &c.Blocked, &c.Hold, &c.Due, &c.May, &c.Done, &c.Moved, &c.Queue, &c.Revisit, &c.Confidence, &c.Exit, &c.Woke, &c.Snoozed, &c.Approved); e != nil {
 			if errors.Is(e, sql.ErrNoRows) {
 				return nil, code("not_found", "card not found")
 			}
 			return nil, e
 		}
+		c.V3 = true
 		out = append(out, c)
 	}
 	return out, nil
@@ -836,6 +858,12 @@ func (s *Store) askUndo(actor string, a map[string]any) (any, error) {
 			if _, e = tx.Exec("update cards set lane=?,title=?,summary=?,owner=?,policy=?,blocked=?,hold_until=?,due=?,maybe_on=?,done=?,moved_at=?,updated_at=? where id=?",
 				c.Lane, c.Title, c.Summary, c.Owner, c.Policy, c.Blocked, c.Hold, c.Due, c.May, c.Done, c.Moved, at, c.ID); e != nil {
 				return nil, e
+			}
+			if c.V3 {
+				if _, e = tx.Exec("update cards set queue=?,revisit=?,confidence=?,exit=?,woke_at=?,snoozed=?,approved=? where id=?",
+					c.Queue, c.Revisit, c.Confidence, c.Exit, c.Woke, c.Snoozed, c.Approved, c.ID); e != nil {
+					return nil, e
+				}
 			}
 			if e = event(tx, c.ID, actor, "undo", at, map[string]any{"ask": r.ID, "lane": c.Lane}); e != nil {
 				return nil, e

@@ -449,3 +449,52 @@ func h(t *testing.T, s *Store, actor, op string, a map[string]any) map[string]an
 	m, _ := v.(map[string]any)
 	return m
 }
+
+func TestAskCardMoveTakesV3Lanes(t *testing.T) {
+	s, _ := boardStore(t)
+	id := h(t, s, "kes", "card.add", map[string]any{"project": "p", "title": "Stage it"})["id"].(string)
+	other := h(t, s, "kes", "card.add", map[string]any{"project": "p", "title": "Ship it"})["id"].(string)
+	ask := h(t, s, "kes", "ask.add", map[string]any{"card": id, "question": "Where does this go?", "actions": []any{
+		map[string]any{"key": "bbw", "label": "Build But Wait", "ops": []any{map[string]any{"op": "card.move", "id": id, "lane": "queue", "queue": "build-but-wait"}}},
+		map[string]any{"key": "done", "label": "Done", "ops": []any{map[string]any{"op": "card.move", "id": other, "lane": "done", "confidence": "medium", "exit": "next deploy shows it", "revisit": "2026-11-12"}}},
+	}})
+	h(t, s, "kevin", "ask.resolve", map[string]any{"id": ask["id"], "choice": "bbw"})
+	var lane, queue string
+	_ = s.db.QueryRow("select lane,coalesce(queue,'') from cards where id=?", id).Scan(&lane, &queue)
+	if lane != "queue" || queue != "build-but-wait" {
+		t.Fatalf("moved to %s/%s", lane, queue)
+	}
+	for name, op := range map[string]map[string]any{
+		"queue lane without queue": {"op": "card.move", "id": id, "lane": "queue"},
+		"queue off the queue lane": {"op": "card.move", "id": id, "lane": "todo", "queue": "just-do-it"},
+		"bad queue":                {"op": "card.move", "id": id, "lane": "queue", "queue": "someday"},
+		"confidence on legacy":     {"op": "card.move", "id": id, "lane": "review", "confidence": "high"},
+		"unknown lane":             {"op": "card.move", "id": id, "lane": "proving"},
+	} {
+		if _, e := s.HandleAs("kes", "ask.add", map[string]any{"card": id, "question": "Q?", "actions": []any{map[string]any{"key": "go", "label": "Go", "ops": []any{op}}}}); e == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func TestAskUndoRestoresV3Columns(t *testing.T) {
+	s, _ := boardStore(t)
+	id := h(t, s, "kes", "card.add", map[string]any{"project": "p", "title": "Watch it", "queue": "just-do-it"})["id"].(string)
+	h(t, s, "kes", "card.move", map[string]any{"id": id, "lane": "running"})
+	h(t, s, "kes", "card.move", map[string]any{"id": id, "lane": "done", "confidence": "medium", "exit": "a week clean", "revisit": "2026-11-14"})
+	ask := h(t, s, "kes", "ask.add", map[string]any{"card": id, "question": "Back to the queue?", "actions": []any{
+		map[string]any{"key": "q", "label": "Requeue", "ops": []any{map[string]any{"op": "card.move", "id": id, "lane": "queue", "queue": "help-me-think"}}},
+	}})
+	h(t, s, "kevin", "ask.resolve", map[string]any{"id": ask["id"], "choice": "q"})
+	var lane, queue, conf, exit string
+	row := func() {
+		_ = s.db.QueryRow("select lane,coalesce(queue,''),coalesce(confidence,''),coalesce(exit,'') from cards where id=?", id).Scan(&lane, &queue, &conf, &exit)
+	}
+	if row(); lane != "queue" || queue != "help-me-think" || conf != "" {
+		t.Fatalf("resolve left %s/%s/%s", lane, queue, conf)
+	}
+	h(t, s, "kevin", "ask.undo", map[string]any{"id": ask["id"]})
+	if row(); lane != "done" || queue != "just-do-it" || conf != "medium" || exit != "a week clean" {
+		t.Fatalf("undo left %s/%s/%s/%q", lane, queue, conf, exit)
+	}
+}
