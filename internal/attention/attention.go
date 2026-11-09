@@ -1417,7 +1417,7 @@ func (s *Store) apply(tx *sql.Tx, at, actor, op, id string, a map[string]any) (a
 				changed = true
 			}
 		case holdAt != "":
-			// Kes keeps it, with a time by which she moves it along.
+			// Kes keeps it, with a time by which he moves it along.
 			if !oldHold.Valid || oldHold.String != holdAt || !oldOwner.Valid || oldOwner.String != "kes" {
 				_, e = tx.Exec("update cards set owner='kes',hold_until=? where id=?", holdAt, id)
 				if e == nil && (!oldOwner.Valid || oldOwner.String != "kes") {
