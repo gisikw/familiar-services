@@ -358,12 +358,13 @@ func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 		return s.services.Scheduler.InboxList(target)
 	case "inbox.claim", "inbox.deliver":
 		ref, _ := r.Args["ref"].(string)
+		caller, _ := r.Args["origin"].(string)
 		var v any
 		var err error
 		if r.Op == "inbox.claim" {
-			v, err = s.services.Scheduler.InboxClaim(ref)
+			v, err = s.services.Scheduler.InboxClaimAs(ref, caller)
 		} else {
-			v, err = s.services.Scheduler.InboxDeliver(ref)
+			v, err = s.services.Scheduler.InboxDeliverAs(ref, caller)
 			if scheduler.IsNotFound(err) {
 				// Not in the inbox: a quiet return waiting for Kes's next
 				// turn ("merged · waiting to reach Kes"). Kev tapped it, so
@@ -377,6 +378,9 @@ func (s *Server) dispatch(r request, connectedTarget string) (any, error) {
 		}
 		if scheduler.IsNotFound(err) {
 			return nil, &attention.CodedError{Code: "not_found", Err: err}
+		}
+		if scheduler.IsForbidden(err) {
+			return nil, &attention.CodedError{Code: "forbidden", Err: err}
 		}
 		return v, err
 	default:

@@ -40,6 +40,8 @@ type InboxItem struct {
 	Headline  string `json:"headline"`
 	CreatedAt int64  `json:"createdAt"`
 	ClaimedAt int64  `json:"claimedAt,omitempty"`
+	// Held: a stored return not yet in the inbox (pull files it).
+	Held bool `json:"held,omitempty"`
 	// Body is the full merge body, only on claim.
 	Body string `json:"body,omitempty"`
 }
@@ -124,8 +126,14 @@ func statusOf(m mergeFacts) string {
 // event to a stub. Returns false (no change) for ambient, already-stubbed or
 // already-claimed merges and for bodies it cannot read.
 func stubMerge(tx *sql.Tx, e *Event, now int64) (bool, error) {
+	return stubMergeOpt(tx, e, now, false)
+}
+
+// stubMergeOpt is stubMerge; allowAmbient files ambient merges too (an
+// explicit pull asked for this one by name).
+func stubMergeOpt(tx *sql.Tx, e *Event, now int64, allowAmbient bool) (bool, error) {
 	var m mergeFacts
-	if json.Unmarshal([]byte(e.Body), &m) != nil || m.ForkSessionID == "" || m.Ambient || m.Stub || m.Claimed {
+	if json.Unmarshal([]byte(e.Body), &m) != nil || m.ForkSessionID == "" || (m.Ambient && !allowAmbient) || m.Stub || m.Claimed {
 		return false, nil
 	}
 	item := InboxItem{ID: e.ID, Target: e.Target, Fork: m.ForkSessionID, Label: m.Label, Status: statusOf(m), Headline: headlineOf(m), CreatedAt: now}
@@ -151,8 +159,98 @@ func stubMerge(tx *sql.Tx, e *Event, now int64) (bool, error) {
 	return err == nil, err
 }
 
-// InboxList returns unclaimed returns for target ("*" for all), oldest first.
+// heldMerges are stored returns that never reached the inbox and aren't in
+// Kes's turn yet: merges still pending (quiet DND holds wakes) or a quiet
+// merge delivered soft that the Pi holds for the next turn. They are as real as an inbox row, so pull sees them
+// (Nov 12: a wake return held by quiet DND said not_found to both imp pull
+// and Kev's "Bring return to Kes" while its full text sat in events).
+// ref "" lists every held tasked return for target; otherwise ref matches
+// an event id, a fork id, or a unique fork-id prefix (8+ chars), ambient
+// returns included.
+func heldMerges(q interface {
+	Query(string, ...any) (*sql.Rows, error)
+}, target, ref string) ([]Event, error) {
+	query := `SELECT ` + eventColumns + ` FROM events WHERE type='merge' AND (state='pending' OR (state='delivered' AND urgency='soft'))
+		AND id NOT IN (SELECT id FROM inbox) AND id NOT LIKE '%-pulled'`
+	args := []any{}
+	if target != "" && target != "*" {
+		query += ` AND target=?`
+		args = append(args, NormalizeTarget(target))
+	}
+	if ref != "" {
+		query += ` AND (id=? OR origin=? OR (length(?)>=8 AND origin LIKE ?||'%'))`
+		args = append(args, ref, ref, ref, ref)
+	}
+	rows, err := q.Query(query+` ORDER BY created_at`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		var m mergeFacts
+		if json.Unmarshal([]byte(e.Body), &m) != nil || m.ForkSessionID == "" || m.Stub || m.Claimed || (m.Ambient && ref == "") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// fileHeld moves one held return into the inbox so it can be claimed: the
+// full body goes to the inbox and the event becomes a soft stub requeued
+// under the same id (a Pi holding the full copy swaps it for the stub), so
+// the return reaches Kes once, by the pull, and the stub only notes it.
+func (s *Store) fileHeld(tx *sql.Tx, ref string) (bool, error) {
+	held, err := heldMerges(tx, "", ref)
+	if err != nil || len(held) == 0 {
+		return false, err
+	}
+	forks := map[string]bool{}
+	for _, e := range held {
+		forks[e.Origin] = true
+	}
+	if len(forks) > 1 {
+		return false, errors.New("ambiguous: " + ref + " matches more than one fork")
+	}
+	for _, e := range held {
+		ok, err := stubMergeOpt(tx, &e, s.now().UnixMilli(), true)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			if _, err := tx.Exec(`UPDATE events SET state='pending', urgency='soft' WHERE id=?`, e.ID); err != nil {
+				return false, err
+			}
+		}
+	}
+	return true, nil
+}
+
+// InboxList returns unclaimed returns for target ("*" for all), oldest first:
+// the inbox, then stored returns still held outside it (Held).
 func (s *Store) InboxList(target string) ([]InboxItem, error) {
+	items, err := s.inboxRows(target)
+	if err != nil {
+		return nil, err
+	}
+	held, err := heldMerges(s.db, target, "")
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range held {
+		var m mergeFacts
+		_ = json.Unmarshal([]byte(e.Body), &m)
+		items = append(items, InboxItem{ID: e.ID, Target: e.Target, Fork: m.ForkSessionID, Label: m.Label, Status: statusOf(m), Headline: headlineOf(m), CreatedAt: e.CreatedAt, Held: true})
+	}
+	return items, nil
+}
+
+func (s *Store) inboxRows(target string) ([]InboxItem, error) {
 	q := `SELECT id,target,fork,label,status,headline,created_at FROM inbox WHERE claimed_at=0`
 	args := []any{}
 	if target != "" && target != "*" {
@@ -176,7 +274,12 @@ func (s *Store) InboxList(target string) ([]InboxItem, error) {
 }
 
 // find matches an inbox id, a fork id, or a unique fork-id prefix (8+ chars).
+// A stored return held outside the inbox is filed first, so it is found too.
 func (s *Store) inboxFind(q *sql.Tx, ref string) (InboxItem, error) {
+	return s.inboxFindOnce(q, ref, false)
+}
+
+func (s *Store) inboxFindOnce(q *sql.Tx, ref string, refiled bool) (InboxItem, error) {
 	ref = strings.TrimPrefix(strings.TrimSpace(ref), "instance:")
 	if ref == "" {
 		return InboxItem{}, errors.New("which return? give a fork id or inbox id")
@@ -194,6 +297,14 @@ func (s *Store) inboxFind(q *sql.Tx, ref string) (InboxItem, error) {
 			return InboxItem{}, err
 		}
 		found = append(found, x)
+	}
+	if len(found) == 0 && !refiled {
+		rows.Close()
+		if ok, err := s.fileHeld(q, ref); err != nil {
+			return InboxItem{}, err
+		} else if ok {
+			return s.inboxFindOnce(q, ref, true)
+		}
 	}
 	if len(found) == 0 {
 		return InboxItem{}, &notFound{"no return for " + ref}
@@ -220,9 +331,23 @@ var errNotFound = errors.New("not found")
 // IsNotFound reports an unknown inbox reference.
 func IsNotFound(err error) bool { return errors.Is(err, errNotFound) }
 
+// Forbidden: a caller asked to consume a return addressed to someone else.
+type Forbidden struct{ msg string }
+
+func (f *Forbidden) Error() string { return f.msg }
+
+// IsForbidden reports a pull by an instance the return isn't addressed to.
+func IsForbidden(err error) bool { var f *Forbidden; return errors.As(err, &f) }
+
 // InboxClaim marks a return received and hands back its full body. Claiming
 // twice returns the body again (a pull can be re-read), flagged by ClaimedAt.
-func (s *Store) InboxClaim(ref string) (InboxItem, error) {
+func (s *Store) InboxClaim(ref string) (InboxItem, error) { return s.InboxClaimAs(ref, "") }
+
+// InboxClaimAs is InboxClaim for a known caller: only the instance a return
+// is addressed to may consume it (Nov 11: a fork pulled a sibling's return
+// and it vanished from Kev's Open unread). Forks read the record instead.
+// caller "" (Kev's own Open, a service) is not checked.
+func (s *Store) InboxClaimAs(ref, caller string) (InboxItem, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return InboxItem{}, err
@@ -231,6 +356,9 @@ func (s *Store) InboxClaim(ref string) (InboxItem, error) {
 	x, err := s.inboxFind(tx, ref)
 	if err != nil {
 		return InboxItem{}, err
+	}
+	if caller = strings.TrimSpace(caller); caller != "" && NormalizeTarget(caller) != x.Target {
+		return InboxItem{}, &Forbidden{"that return is addressed to " + x.Target + "; only it may pull it. Read the fork's record instead: state/forks/" + x.Fork + "/"}
 	}
 	wasClaimed := x.ClaimedAt
 	if x.ClaimedAt == 0 {
@@ -255,8 +383,11 @@ const sourceInboxDeliver = "inbox.deliver"
 // InboxDeliver claims a return and sends it in full to its target as a wake:
 // Kev tapped it in Open. While that delivery is in flight the merge shows as
 // undelivered (settled), so the row stays until Kes has it.
-func (s *Store) InboxDeliver(ref string) (Event, error) {
-	x, err := s.InboxClaim(ref)
+func (s *Store) InboxDeliver(ref string) (Event, error) { return s.InboxDeliverAs(ref, "") }
+
+// InboxDeliverAs is InboxDeliver for a known caller (see InboxClaimAs).
+func (s *Store) InboxDeliverAs(ref, caller string) (Event, error) {
+	x, err := s.InboxClaimAs(ref, caller)
 	if err != nil {
 		return Event{}, err
 	}
